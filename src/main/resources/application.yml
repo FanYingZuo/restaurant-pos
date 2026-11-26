@@ -1,0 +1,43 @@
+# 執行環境預設為正式；只有 POS_ENV=dev 才是開發（docs/plan/01-PLAN.md §4.9、§4.5）。
+# 所有機密與環境值只從環境變數讀取，不寫進版本控制。
+spring:
+  profiles:
+    active: ${POS_ENV:prod}
+  datasource:
+    url: ${POS_DB_URL:}
+    username: ${POS_DB_USER:}
+    password: ${POS_DB_PASSWORD:}
+    hikari:
+      transaction-isolation: TRANSACTION_REPEATABLE_READ
+      connection-init-sql: SET SESSION innodb_lock_wait_timeout=5
+      data-source-properties:
+        connectionTimeZone: UTC
+        forceConnectionTimeZoneToSession: true
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  jackson:
+    default-property-inclusion: always
+
+server:
+  address: 127.0.0.1
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+restaurantpos:
+  base-url: ${POS_BASE_URL:}
+  trusted-proxies: ${POS_TRUSTED_PROXIES:}
+  pin-secret: ${POS_PIN_SECRET:}
+  first-manager-pin: ${POS_FIRST_MANAGER_PIN:}
+  image-dir: ${POS_IMAGE_DIR:data/images}

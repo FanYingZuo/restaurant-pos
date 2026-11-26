@@ -1,0 +1,9 @@
+# 開發環境（POS_ENV=dev）：Swagger 開啟；未設定的值使用開發預設並印警告。
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+restaurantpos:
+  base-url: ${POS_BASE_URL:http://localhost:8080}
