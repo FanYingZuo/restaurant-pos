@@ -12,4 +12,7 @@ public interface DeviceAuthenticator {
      * 驗證裝置憑證。憑證不存在與已撤銷**不得區分**（回傳同樣的空值）；通過時順便更新最後使用時間（以分鐘為單位）。
      */
     Optional<DevicePrincipal> authenticate(String credential);
+
+    /** 裝置是否仍有效（已配對且未撤銷）。WebSocket 每次心跳重新檢查，撤銷後斷線（§4.5）。 */
+    boolean isActive(long deviceId);
 }

@@ -35,7 +35,8 @@ public class DeviceAuthService implements DeviceAuthenticator {
         return device.map(d -> new DevicePrincipal(d.getId(), d.getDeviceType()));
     }
 
-    /** 裝置是否仍有效（未撤銷）。供 WebSocket 每次心跳重新檢查（卡 6.3）。 */
+    /** 裝置是否仍有效（已配對且未撤銷）。WebSocket 每次心跳重新檢查（卡 6.3）。 */
+    @Override
     @Transactional(readOnly = true)
     public boolean isActive(long deviceId) {
         return devices.findById(deviceId).filter(d -> !d.isRevoked() && d.isPaired()).isPresent();

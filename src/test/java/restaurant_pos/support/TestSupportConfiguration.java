@@ -19,7 +19,7 @@ public class TestSupportConfiguration {
 
     @Bean
     @Primary
-    public RecordingPusher recordingPusher() {
-        return new RecordingPusher();
+    public RecordingPusher recordingPusher(restaurant_pos.kds.StompPusher stomp) {
+        return new RecordingPusher(stomp);
     }
 }

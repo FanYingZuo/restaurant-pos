@@ -8,6 +8,11 @@ package restaurant_pos.shared.security;
  */
 public interface PinVerifier {
 
+    /** PIN 格式：4～6 位數字。需要「先格式後業務」（§4.4）的呼叫者用它先檢查，再於狀態檢查之後呼叫 {@link #verify}。 */
+    static boolean isValidFormat(String pin) {
+        return pin != null && pin.matches("^[0-9]{4,6}$");
+    }
+
     /**
      * 驗證 PIN 並回傳在職員工。員工已停用與 PIN 不存在一律回 {@code INVALID_PIN}（不洩漏「已停用」）；
      * 被鎖定回 {@code PIN_LOCKED}。PIN 格式不合法（不是 4～6 位數字）回 {@code VALIDATION_ERROR}。

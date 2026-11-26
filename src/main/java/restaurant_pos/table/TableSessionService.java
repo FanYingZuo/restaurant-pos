@@ -151,7 +151,7 @@ public class TableSessionService {
 
     /** 服務費開關：需 PIN 並寫稽核；先檢查狀態、之後才驗 PIN（避免用錯誤 PIN 探測資料狀態）。 */
     public SessionSummary setServiceCharge(long sessionId, Boolean enabled, String pin) {
-        if (enabled == null) {
+        if (enabled == null || !PinVerifier.isValidFormat(pin)) {
             throw new ApiException(ErrorCode.VALIDATION_ERROR);
         }
         return tx.execute(status -> {
@@ -185,6 +185,31 @@ public class TableSessionService {
         if (s.isCheckoutInProgress()) {
             throw new ApiException(ErrorCode.CHECKOUT_IN_PROGRESS);
         }
+    }
+
+    /** 廚房清單需要的用餐紀錄資訊（桌號、狀態、營業日）。 */
+    public record KitchenSessionView(String tableNo, SessionStatus status, LocalDate businessDate) {
+    }
+
+    /**
+     * 批次取得廚房清單需要的用餐紀錄資訊（固定 2 次查詢，不在迴圈內逐筆查詢）。
+     * 供 order 模組組合廚房清單；已刪除桌位的桌號仍會回傳。
+     */
+    @Transactional(readOnly = true)
+    public java.util.Map<Long, KitchenSessionView> kitchenViews(java.util.Collection<Long> sessionIds) {
+        java.util.Map<Long, KitchenSessionView> result = new java.util.HashMap<>();
+        if (sessionIds.isEmpty()) {
+            return result;
+        }
+        List<TableSession> found = sessions.findAllById(sessionIds);
+        java.util.Map<Long, String> tableNos = new java.util.HashMap<>();
+        tables.findAllById(found.stream().map(TableSession::getTableId).distinct().toList())
+                .forEach(t -> tableNos.put(t.getId(), t.getTableNo()));
+        for (TableSession s : found) {
+            result.put(s.getId(), new KitchenSessionView(tableNos.getOrDefault(s.getTableId(), ""), s.getStatus(),
+                    s.getBusinessDate()));
+        }
+        return result;
     }
 
     // ---- 供其他模組使用（呼叫者必須已在交易中；以下方法都要求既有交易） ----
