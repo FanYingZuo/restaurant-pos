@@ -6,11 +6,11 @@
 ## 目前狀態
 
 - 規格：**規格說明書 v1（2026-11-26）**，四份文件 01-PLAN／02-TODO／03-BOUNDARIES／04-LOG。
-- 實作：**卡 0.1 完成（待確認）。1／107 張卡；已有 Spring Boot 骨架，尚無遷移檔、尚無資料庫。**
+- 實作：**卡 0.2 完成（待確認）。2/107 張卡；已有 Spring Boot 骨架、JPA＋Flyway、V1 遷移檔（草擬欄位待審）、遷移測試 7/7。**
 - 待決：無。
   - 已結案：#1（HTTP 狀態對照）、#2（列印重試等待）、#3（建置工具）、#4（套件根名稱 `restaurant_pos`）。
 - 開工前（使用者）：git commit 留起點 → 四份文件放進 `docs/plan/`、舊文件移 `docs/archive/` → 建立 `CLAUDE.md` → 確認 Docker 可執行、JDK 17 可用。
-- 下一張卡：**0.2**（待使用者確認 0.1）。
+- 下一張卡：**0.3**（待使用者審定 V1 欄位）。
 
 ---
 
@@ -27,6 +27,14 @@
 ```
 
 ---
+
+## 2026-11-26　卡 0.2 MySQL 8＋Testcontainers＋V1 遷移檔
+- 做了：使用者決定待決 #5（V1 只含 S0 三張表，欄位草擬待審）與 #6（加 docker-compose.yml）。新增依賴：Spring Data JPA、Flyway＋flyway-mysql、MySQL 驅動（runtime）、Testcontainers（mysql、junit-jupiter，test）、spring-boot-testcontainers（test）。寫 V1 遷移檔、開發用 compose、遷移測試 7 個。
+- 動到的程式碼：修改 pom.xml；新增 src/main/resources/db/migration/V1__s0_base_tables.sql、docker-compose.yml、src/test/java/restaurant_pos/shared/MigrationV1Test.java。
+- 決定：V1 欄位草擬（使用者尚未審定，見下）— app_setting（id、setting_key 唯一、setting_value、updated_at）；audit_log（id、occurred_at、business_date、action、actor_employee_id、actor_device_id、target_type、target_id、detail）；device（id、device_type、name、credential_hash 唯一、created_at、revoked_at）。時間皆 DATETIME(6)。mysql:8.0 映像。
+- 待決：#7 已結案（使用者選 A，surefire argLine 加 -Dapi.version=1.44，pom 已修改）。
+- 測試：本卡 7／7；全部 7／7（本卡為第一張有測試的卡，無前面階段測試）。執行指令：`mvn test`。
+- 下一步：使用者審定 V1 欄位；通過後卡 0.3。
 
 ## 2026-11-26　卡 0.1 建立 Spring Boot 骨架（待「好」）
 - 做了：使用者確認計畫（依賴只用 spring-boot-starter＋test；編譯目標 Java 17；加 .gitignore；代做開工前事項）。建立 pom.xml（Spring Boot 3.5.6、release 17）、入口類別、九個模組的 package-info.java。開工前事項：四份文件移到 docs/plan/、建立 CLAUDE.md、git init、加 origin（https://github.com/FanYingZuo/restaurant-pos.git，遠端查無 refs）。
@@ -77,7 +85,6 @@
 
 | # | 問題 | 擋住的卡 | 建議選項（AI 不可自行採用） | 決定 |
 | --- | --- | --- | --- | --- |
-| — | 目前無待決問題 | — | — | — |
 
 ### 已結案
 
@@ -87,3 +94,6 @@
 | 2 | 列印重試等待值多一個 | A：刪掉第 5 個等待值，共 5 次嘗試，已寫入 01-PLAN §5 S11 |
 | 3 | 建置工具未指定 | A：Maven，已寫入 01-PLAN §3 |
 | 4 | 套件根名稱未指定 | 使用者決定：`restaurant_pos`，已寫入 01-PLAN §3（同日由使用者提供，非 AI 選項） |
+| 5 | V1 遷移檔範圍與欄位未定 | 使用者決定：A（V1 只含 S0 三張表 app_setting、audit_log、device；欄位為 AI 草擬，待使用者審定） |
+| 6 | 本機 Docker 未執行；是否加 docker-compose.yml | 使用者決定：加 docker-compose.yml（密碼只從 .env 讀）；Docker Desktop 已啟動 |
+| 7 | Testcontainers 與 Docker 29 API 版本不相容 | 使用者決定：A，把 -Dapi.version=1.44 寫進 pom 的 surefire argLine（不改依賴版本）；直接 mvn test 即可，7/7 通過 |

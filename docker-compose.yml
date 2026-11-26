@@ -1,0 +1,15 @@
+# 開發用 MySQL 8。密碼只從環境變數讀取，不寫進版本控制。
+# 使用前在本機建立 .env（已被 .gitignore 排除），內容：MYSQL_ROOT_PASSWORD=<自行設定>
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?請在 .env 設定 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: restaurant_pos
+    ports:
+      - "3306:3306"
+    volumes:
+      - restaurant_pos_mysql:/var/lib/mysql
+
+volumes:
+  restaurant_pos_mysql:
