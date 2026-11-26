@@ -1,0 +1,235 @@
+# @paths
+  /api/pos/tables:
+    get:
+      tags: [table]
+      operationId: listTables
+      summary: 桌位版面與目前用餐狀態（桌位看板）
+      description: |
+        依桌號自然排序（A2 在 A10 前），不含已刪除桌位。每桌帶「目前占桌的使用中用餐紀錄」摘要（無則為 null）。
+        看板上的小計不在本回應（table 模組不依賴 order）；需要時以 `getSessionDetail` 取得。
+      responses:
+        '200': {description: 桌位, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/TableView'}}}}}
+    post:
+      tags: [table]
+      operationId: createTable
+      summary: 新增桌位（TABLE_LAYOUT）
+      description: 桌號去空白後不分大小寫唯一。方形與圓形的高度必須等於寬度，送了不同寬高回 `VALIDATION_ERROR`，不自動修正。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TableCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/TableLayout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 409: [TABLE_NO_DUPLICATE]}
+  /api/pos/tables/{tableId}:
+    patch:
+      tags: [table]
+      operationId: updateTable
+      summary: 修改桌位（TABLE_LAYOUT）
+      description: 使用中的桌位不可編輯。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TableUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/TableLayout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED, TABLE_NO_DUPLICATE]}
+    delete:
+      tags: [table]
+      operationId: deleteTable
+      summary: 刪除桌位（TABLE_LAYOUT，軟刪除）
+      description: 使用中的桌位不可刪除。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {403: [FORBIDDEN], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED]}
+  /api/pos/tables/{tableId}/open:
+    post:
+      tags: [table]
+      operationId: openTable
+      summary: 開桌
+      description: |
+        流程：鎖桌位 → 檢查未使用 → 鎖並遞增當日流水 → 建立用餐紀錄（token、QR 到期＝開桌＋4 小時、服務費預設值）→ 桌位使用中 → 發佈用餐開始。
+        **回應不含 token**；token 只在 QR 圖片（`getSessionQr`）與 QR 列印單。同時開同一桌只一個成功，其餘回 409。
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OpenTableRequest'}}}
+      responses:
+        '201': {description: 已開桌, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED, CONCURRENT_MODIFICATION]}
+  /api/pos/sessions/pending-recheckout:
+    get:
+      tags: [table]
+      operationId: listPendingRecheckout
+      summary: 待重新結帳的用餐紀錄清單
+      description: 作廢後重開且原桌已被占用或已刪除（不占桌重開）的用餐紀錄。
+      responses:
+        '200': {description: 清單, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SessionSummary'}}}}}
+  /api/pos/sessions/{sessionId}/qr:
+    get:
+      tags: [table]
+      operationId: getSessionQr
+      summary: 取得顧客點餐 QR 圖片
+      description: |
+        網址＝公開基底網址（去結尾斜線）＋ `/customer/order/` ＋ 用餐紀錄編號 ＋ `#t=` token。
+        只有「使用中」可取得；QR 有效期在查詢時判斷（過期仍可取得圖片，但顧客不能送新單）。
+        需裝置憑證標頭，前端須以程式取得 blob 後顯示（不能直接用 img 標籤）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200':
+          description: PNG 圖片
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Cache-Control: {schema: {type: string, example: 'no-store'}}
+          content:
+            image/png: {schema: {type: string, format: binary}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN]}
+  /api/pos/sessions/{sessionId}/guest-count:
+    patch:
+      tags: [table]
+      operationId: updateGuestCount
+      summary: 修改人數
+      description: 用餐紀錄須使用中且非結帳中；待重新結帳的不可改。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OpenTableRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS]}
+  /api/pos/sessions/{sessionId}/service-charge:
+    put:
+      tags: [table]
+      operationId: setServiceCharge
+      summary: 服務費開關（PIN，寫稽核）
+      description: 條件同修改人數。依 §4.4「狀態檢查之後才驗 PIN」，避免用錯 PIN 探測資料狀態。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ServiceChargeRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS], 429: [PIN_LOCKED]}
+# @schemas
+    TableShape:
+      type: string
+      enum: [SQUARE, ROUND, RECTANGLE]
+    TableLayout:
+      type: object
+      required: [id, tableNo, capacity, shape, width, height, x, y, area]
+      properties:
+        id: {type: integer, format: int64}
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32, description: 區域；空字串表示無}
+    TableView:
+      allOf:
+        - $ref: '#/components/schemas/TableLayout'
+        - type: object
+          required: [inUse]
+          properties:
+            inUse: {type: boolean, description: 是否有占桌的使用中用餐紀錄}
+            session:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/SessionSummary'
+    TableCreate:
+      type: object
+      required: [tableNo, capacity, shape, width, height, x, y]
+      properties:
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32, default: ''}
+    TableUpdate:
+      type: object
+      properties:
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32}
+    SessionStatus:
+      type: string
+      description: 使用中／已結束／已取消
+      enum: [OPEN, CLOSED, CANCELLED]
+    SessionSummary:
+      type: object
+      description: 用餐紀錄摘要。**不含顧客 token**。
+      required: [id, tableId, tableNo, billNo, businessDate, status, occupiesTable, guestCount, openedAt, qrExpiresAt, qrExpired, serviceChargeEnabled, checkoutInProgress, pendingRecheckout]
+      properties:
+        id: {type: integer, format: int64}
+        tableId: {type: integer, format: int64}
+        tableNo: {type: string}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        businessDate: {type: string, format: date}
+        status: {$ref: '#/components/schemas/SessionStatus'}
+        occupiesTable: {type: boolean, description: 使用中但不占桌（不占桌重開）時為 false}
+        guestCount: {type: integer, minimum: 1, maximum: 99}
+        openedAt: {type: string, format: date-time}
+        qrExpiresAt: {type: string, format: date-time}
+        qrExpired: {type: boolean, description: 查詢時判斷}
+        serviceChargeEnabled: {type: boolean}
+        checkoutInProgress: {type: boolean}
+        pendingRecheckout: {type: boolean}
+    OpenTableRequest:
+      type: object
+      required: [guestCount]
+      properties:
+        guestCount: {type: integer, minimum: 1, maximum: 99}
+    ServiceChargeRequest:
+      type: object
+      required: [enabled, pin]
+      properties:
+        enabled: {type: boolean}
+        pin: {$ref: '#/components/schemas/Pin'}

@@ -1,0 +1,317 @@
+# @paths
+  /api/pos/sessions/{sessionId}:
+    get:
+      tags: [order]
+      operationId: getSessionDetail
+      summary: 用餐詳情
+      description: |
+        用餐紀錄、草稿、所有正式單（含已取消）、小計。小計只算正式單未取消品項，**不含草稿與服務費**。
+        任何狀態的用餐紀錄都可查詢。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 用餐詳情, content: {application/json: {schema: {$ref: '#/components/schemas/SessionDetail'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [SESSION_NOT_FOUND]}
+  /api/pos/sessions/{sessionId}/draft/items:
+    post:
+      tags: [order]
+      operationId: addDraftItem
+      summary: 草稿新增品項
+      description: |
+        每個用餐紀錄最多一張草稿（不存在則建立）。價格以最新菜單為準；草稿不寫歷史、不發事件。
+        前置檢查：用餐紀錄使用中、非結帳中、非待重新結帳。選項驗證依序：數量 1～99 → 同一選項不重複 → 選項屬於品項的群組 → 每群不同選項數在最少與最多之間（不允許重複時數量不大於 1）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemInput'}}}
+      responses:
+        '201': {description: 已新增（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, MENU_ITEM_NOT_SELLABLE]}
+  /api/pos/sessions/{sessionId}/draft/items/{draftItemId}:
+    put:
+      tags: [order]
+      operationId: replaceDraftItem
+      summary: 草稿修改品項（整筆取代）
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: draftItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemInput'}}}
+      responses:
+        '200': {description: 已更新（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, DRAFT_ITEM_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, MENU_ITEM_NOT_SELLABLE]}
+    delete:
+      tags: [order]
+      operationId: deleteDraftItem
+      summary: 草稿刪除品項（實體刪除）
+      description: 草稿變空時保留空草稿。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: draftItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已刪除（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND, DRAFT_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS]}
+  /api/pos/sessions/{sessionId}/draft/submit:
+    post:
+      tags: [order]
+      operationId: submitDraft
+      summary: 送出草稿（出單）
+      description: |
+        流程：驗證請求編號 → 鎖用餐紀錄 → 冪等重播（同編號回原結果，不論內容）→ 結帳中拒絕 → 空草稿拒絕 → 每項**重新**檢查可售與選項（任一失敗整張失敗）→ 轉正式單 → 寫歷史 → 發佈訂單送出。
+        批次號＝該用餐紀錄最大批次＋1；同時出單只一個成功且批次號不重複。新建立回 201，重播回 200（`replayed` 為 true）。
+        `note` 為訂單備註（0～255 字）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SubmitDraftRequest'}}}
+      responses:
+        '200': {description: 重播（同請求編號）, content: {application/json: {schema: {$ref: '#/components/schemas/SubmitResult'}}}}
+        '201': {description: 已出單, content: {application/json: {schema: {$ref: '#/components/schemas/SubmitResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, EMPTY_DRAFT, MENU_ITEM_NOT_SELLABLE, CONCURRENT_MODIFICATION]}
+  /api/pos/order-items/{orderItemId}:
+    patch:
+      tags: [order]
+      operationId: modifyOrderItem
+      summary: 修改已送出品項
+      description: |
+        鎖後重新載入；依序拒絕：草稿（`ORDER_NOT_EDITABLE`）→ 結帳中 → 已取消 → 已完成 → 版本不符。
+        製作中的品項修改後保持製作中；以目前菜單重建快照（改價後採用新價格）；寫前後摘要歷史、重算訂單狀態、發佈品項修改（列印修改單）。
+      parameters:
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifyOrderItemRequest'}}}
+      responses:
+        '200': {description: 已修改, content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [ORDER_ITEM_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, ORDER_NOT_EDITABLE, CHECKOUT_IN_PROGRESS, ORDER_ITEM_CANCELLED, ORDER_ITEM_ALREADY_READY, CONCURRENT_MODIFICATION]}
+  /api/pos/order-items/{orderItemId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelOrderItem
+      summary: 取消品項（PIN）
+      description: 「狀態檢查之後才驗 PIN」，避免用錯 PIN 探測資料狀態。已完成不可取消。記理由與操作員工；寫歷史並發佈品項取消（列印取消單）。
+      parameters:
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [ORDER_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS, ORDER_NOT_EDITABLE, ORDER_ITEM_CANCELLED, ORDER_ITEM_ALREADY_READY], 429: [PIN_LOCKED]}
+  /api/pos/orders/{orderId}/note:
+    patch:
+      tags: [order]
+      operationId: updateOrderNote
+      summary: 修改訂單備註
+      description: 只寫歷史，不發事件；帶訂單版本。
+      parameters:
+        - {name: orderId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateOrderNoteRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/OrderView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [ORDER_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, ORDER_NOT_EDITABLE, CHECKOUT_IN_PROGRESS, CONCURRENT_MODIFICATION]}
+  /api/pos/orders/{orderId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelOrder
+      summary: 取消整單（PIN）
+      description: 有任何已完成品項就不可取消；逐項取消並各自寫歷史、發事件。狀態檢查後才驗 PIN。
+      parameters:
+        - {name: orderId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/OrderView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [ORDER_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS, ORDER_NOT_EDITABLE, ORDER_ITEM_ALREADY_READY], 429: [PIN_LOCKED]}
+  /api/pos/sessions/{sessionId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelSession
+      summary: 取消開桌（PIN）
+      description: 有任何未取消的正式單品項就不可取消；成功後草稿實體刪除、用餐紀錄已取消、桌位回空桌；帳單號不回收。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, SESSION_HAS_SUBMITTED_ORDERS], 429: [PIN_LOCKED]}
+# @schemas
+    ItemStatus:
+      type: string
+      description: 待處理／製作中／已完成／已取消。已完成與已取消是終點。
+      enum: [PENDING, IN_PROGRESS, DONE, CANCELLED]
+    OrderStatus:
+      type: string
+      description: 已送出／製作中／部分上餐／已全部上餐／已取消（只看未取消品項重算）
+      enum: [SUBMITTED, IN_PROGRESS, PARTIALLY_SERVED, SERVED, CANCELLED]
+    OrderSource:
+      type: string
+      enum: [STAFF, CUSTOMER]
+    SelectedModifier:
+      type: object
+      required: [modifierId, quantity]
+      properties:
+        modifierId: {type: integer, format: int64}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+    OrderItemInput:
+      type: object
+      required: [menuItemId, quantity]
+      properties:
+        menuItemId: {type: integer, format: int64}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/SelectedModifier'}
+        note: {type: string, maxLength: 255, default: ''}
+    ItemModifierView:
+      type: object
+      required: [modifierId, name, priceDelta, quantity]
+      properties:
+        modifierId: {type: integer, format: int64}
+        name: {type: string}
+        priceDelta: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+    DraftItemView:
+      type: object
+      required: [id, menuItemId, name, basePrice, unitPrice, quantity, lineTotal, station, modifiers, note]
+      properties:
+        id: {type: integer, format: int64}
+        menuItemId: {type: integer, format: int64}
+        name: {type: string}
+        basePrice: {$ref: '#/components/schemas/Money'}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+        note: {type: string}
+    DraftView:
+      type: object
+      required: [orderId, items]
+      properties:
+        orderId: {type: integer, format: int64}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/DraftItemView'}
+    OrderItemView:
+      type: object
+      description: 單價＝基本價＋Σ（加價×數量）；小計＝單價×數量。名稱、價格、站別、選項為建立時的快照。
+      required: [id, orderId, menuItemId, name, basePrice, unitPrice, quantity, lineTotal, station, modifiers, note, status, version]
+      properties:
+        id: {type: integer, format: int64}
+        orderId: {type: integer, format: int64}
+        menuItemId: {type: integer, format: int64}
+        name: {type: string}
+        basePrice: {$ref: '#/components/schemas/Money'}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+        note: {type: string}
+        status: {$ref: '#/components/schemas/ItemStatus'}
+        version: {type: integer, description: 狀態／數量／選項／備註變更時 +1}
+        cancelReason: {type: string, nullable: true}
+        cancelledAt: {type: string, format: date-time, nullable: true}
+    OrderView:
+      type: object
+      required: [id, batchNo, status, source, note, version, submittedAt, items]
+      properties:
+        id: {type: integer, format: int64}
+        batchNo: {type: integer, description: 該用餐紀錄內的批次號}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        source: {$ref: '#/components/schemas/OrderSource'}
+        note: {type: string}
+        version: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/OrderItemView'}
+    SessionDetail:
+      type: object
+      required: [session, draft, orders, subtotal]
+      properties:
+        session: {$ref: '#/components/schemas/SessionSummary'}
+        draft:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DraftView'
+        orders:
+          type: array
+          items: {$ref: '#/components/schemas/OrderView'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+    SubmitDraftRequest:
+      type: object
+      required: [requestId]
+      properties:
+        requestId: {$ref: '#/components/schemas/RequestKey'}
+        note: {type: string, maxLength: 255, default: ''}
+    SubmitResult:
+      type: object
+      required: [orderId, batchNo, itemCount, replayed]
+      properties:
+        orderId: {type: integer, format: int64}
+        batchNo: {type: integer}
+        itemCount: {type: integer}
+        replayed: {type: boolean}
+    ModifyOrderItemRequest:
+      type: object
+      required: [expectedVersion, quantity]
+      properties:
+        expectedVersion: {type: integer, description: 與目前版本不符回 CONCURRENT_MODIFICATION}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/SelectedModifier'}
+        note: {type: string, maxLength: 255, default: ''}
+    UpdateOrderNoteRequest:
+      type: object
+      required: [expectedVersion, note]
+      properties:
+        expectedVersion: {type: integer}
+        note: {type: string, maxLength: 255}

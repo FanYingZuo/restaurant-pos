@@ -1,0 +1,167 @@
+# @paths
+  /api/pos/reports/revenue:
+    get:
+      tags: [report]
+      operationId: getRevenueReport
+      summary: 營業額報表（逐日）
+      description: |
+        起訖皆為營業日且**都算在內**，最多 92 個營業日（相差 91 天可以、92 天不行）；起晚於訖或超過 → `INVALID_DATE_RANGE`。
+        沒資料的日子也回 0；另有合計列。聚合在 DB 完成，報表不改任何資料。
+      parameters:
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+      responses:
+        '200': {description: 報表, content: {application/json: {schema: {$ref: '#/components/schemas/RevenueReport'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_DATE_RANGE]}
+  /api/pos/reports/today:
+    get:
+      tags: [report]
+      operationId: getTodayOverview
+      summary: 今日總覽（即時，不快取）
+      responses:
+        '200': {description: 今日總覽, content: {application/json: {schema: {$ref: '#/components/schemas/TodayOverview'}}}}
+  /api/pos/reports/day-close/preview:
+    get:
+      tags: [report]
+      operationId: previewDayClose
+      summary: 日結預覽（免 PIN）
+      description: |
+        預期現金＝備用金＋當日完成帳單的現金入帳（不含找零，依帳單營業日）；差額＝實點−預期。預覽與存檔用同一函式。不能日結未來。
+      parameters:
+        - {name: date, in: query, required: true, schema: {type: string, format: date}}
+        - {name: reserveFund, in: query, required: true, schema: {type: integer, minimum: 0}}
+        - {name: countedCash, in: query, required: true, schema: {type: integer, minimum: 0}}
+      responses:
+        '200': {description: 日結試算, content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR, DAY_CLOSE_FUTURE_DATE]}
+  /api/pos/reports/day-close:
+    post:
+      tags: [report]
+      operationId: saveDayClose
+      summary: 日結存檔（PIN）
+      description: 先檢查日期（未來日期回 `DAY_CLOSE_FUTURE_DATE`）再驗 PIN；同一天可多筆，最新為準；不鎖資料。這是報表模組唯一的寫入。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseRequest'}}}
+      responses:
+        '201': {description: 已存檔, content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseRecord'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR, DAY_CLOSE_FUTURE_DATE], 403: [INVALID_PIN], 429: [PIN_LOCKED]}
+  /api/pos/reports/work-hours:
+    get:
+      tags: [report]
+      operationId: getWorkHoursReport
+      summary: 工時報表
+      description: |
+        依日、週（週一起算）、月分組，可依員工篩選；只計完整班次（含更正後完整的，標示「已更正」）；歸屬上班營業日；已停用員工名稱仍顯示。
+        異常清單列出上班未打卡與下班未打卡的班次（不計工時）。
+      parameters:
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+        - {name: groupBy, in: query, required: false, schema: {type: string, enum: [DAY, WEEK, MONTH], default: DAY}}
+        - {name: employeeId, in: query, required: false, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 報表, content: {application/json: {schema: {$ref: '#/components/schemas/WorkHoursReport'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_DATE_RANGE], 404: [EMPLOYEE_NOT_FOUND]}
+# @schemas
+    RevenueRow:
+      type: object
+      required: [tableCount, guestCount, revenue, subtotal, serviceCharge, voidCount, abandonCount, refundCount, cancelledItemCount]
+      properties:
+        tableCount: {type: integer, description: 桌數}
+        guestCount: {type: integer, description: 人數}
+        revenue: {$ref: '#/components/schemas/Money'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        serviceCharge: {$ref: '#/components/schemas/Money'}
+        voidCount: {type: integer, description: 作廢數}
+        abandonCount: {type: integer, description: 放棄數}
+        refundCount: {type: integer, description: 退回付款數}
+        cancelledItemCount: {type: integer, description: 取消品項數}
+    RevenueDay:
+      allOf:
+        - $ref: '#/components/schemas/RevenueRow'
+        - type: object
+          required: [businessDate]
+          properties:
+            businessDate: {type: string, format: date}
+    RevenueReport:
+      type: object
+      required: [from, to, days, total]
+      properties:
+        from: {type: string, format: date}
+        to: {type: string, format: date}
+        days:
+          type: array
+          items: {$ref: '#/components/schemas/RevenueDay'}
+        total: {$ref: '#/components/schemas/RevenueRow'}
+    TodayOverview:
+      type: object
+      required: [businessDate, revenue, openTableCount, onDutyCount]
+      properties:
+        businessDate: {type: string, format: date}
+        revenue: {$ref: '#/components/schemas/Money'}
+        openTableCount: {type: integer, description: 使用中桌數}
+        onDutyCount: {type: integer, description: 上班中人數}
+    DayCloseRequest:
+      type: object
+      required: [date, reserveFund, countedCash, pin]
+      properties:
+        date: {type: string, format: date}
+        reserveFund: {type: integer, minimum: 0}
+        countedCash: {type: integer, minimum: 0}
+        pin: {$ref: '#/components/schemas/Pin'}
+    DayCloseView:
+      type: object
+      required: [businessDate, reserveFund, cashReceived, expectedCash, countedCash, difference]
+      properties:
+        businessDate: {type: string, format: date}
+        reserveFund: {$ref: '#/components/schemas/Money'}
+        cashReceived: {$ref: '#/components/schemas/Money'}
+        expectedCash: {$ref: '#/components/schemas/Money'}
+        countedCash: {$ref: '#/components/schemas/Money'}
+        difference: {type: integer, format: int64, description: 實點−預期（可為負）}
+    DayCloseRecord:
+      allOf:
+        - $ref: '#/components/schemas/DayCloseView'
+        - type: object
+          required: [id, closedAt, employeeId, employeeName]
+          properties:
+            id: {type: integer, format: int64}
+            closedAt: {type: string, format: date-time}
+            employeeId: {type: integer, format: int64}
+            employeeName: {type: string}
+    WorkHoursRow:
+      type: object
+      required: [employeeId, employeeName, minutes, shiftCount, includesCorrected]
+      properties:
+        employeeId: {type: integer, format: int64}
+        employeeName: {type: string}
+        minutes: {type: integer}
+        shiftCount: {type: integer}
+        includesCorrected: {type: boolean, description: 該期間內含已更正班次}
+    WorkHoursGroup:
+      type: object
+      required: [periodStart, periodEnd, rows]
+      properties:
+        periodStart: {type: string, format: date}
+        periodEnd: {type: string, format: date}
+        rows:
+          type: array
+          items: {$ref: '#/components/schemas/WorkHoursRow'}
+    WorkHoursReport:
+      type: object
+      required: [groupBy, groups, anomalies]
+      properties:
+        groupBy: {type: string, enum: [DAY, WEEK, MONTH]}
+        groups:
+          type: array
+          items: {$ref: '#/components/schemas/WorkHoursGroup'}
+        anomalies:
+          type: array
+          items: {$ref: '#/components/schemas/ShiftRecord'}

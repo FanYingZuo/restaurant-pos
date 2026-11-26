@@ -1,0 +1,170 @@
+# @paths
+  /api/customer/menu:
+    get:
+      tags: [customer]
+      operationId: getCustomerMenu
+      summary: 顧客菜單（無需驗證）
+      description: 只含上架分類中的可售品項；空分類不出現；加價為 0 也回傳。依顯示順序。不含站別、上下架、售完日等內部欄位。
+      security: []
+      responses:
+        '200': {description: 菜單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerMenu'}}}}
+  /api/customer/images/{imageKey}:
+    get:
+      tags: [customer]
+      operationId: getMenuImage
+      summary: 菜單圖片（無需驗證）
+      description: 讀取前先驗證鍵格式（防路徑穿越）；回應帶「禁止猜測內容類型」與可快取標頭。
+      security: []
+      parameters:
+        - {name: imageKey, in: path, required: true, schema: {type: string, maxLength: 128}}
+      responses:
+        '200':
+          description: JPEG 或 PNG
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Cache-Control: {schema: {type: string, example: 'public, max-age=86400'}}
+          content:
+            image/jpeg: {schema: {type: string, format: binary}}
+            image/png: {schema: {type: string, format: binary}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [NOT_FOUND]}
+  /api/customer/sessions/{sessionId}:
+    get:
+      tags: [customer]
+      operationId: verifyCustomerSession
+      summary: 驗證用餐紀錄並取得點餐狀態
+      description: |
+        缺 token 或長度不符、用餐紀錄不存在、token 不符，一律回**完全相同**的 401 `SESSION_TOKEN_INVALID`；驗證本身不檢查狀態與過期。
+        `canOrder`＝使用中、未過期、非結帳中、不是待重新結帳。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 目前狀態, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSession'}}}}
+        '401': {$ref: '#/components/responses/E401'}
+      x-error-codes: {401: [SESSION_TOKEN_INVALID]}
+  /api/customer/sessions/{sessionId}/orders:
+    post:
+      tags: [customer]
+      operationId: submitCustomerOrder
+      summary: 顧客送單
+      description: |
+        流程：token 驗證 → 鎖用餐紀錄並重新比對 token 與狀態 → 冪等（內容雜湊）→ 過期 → 結帳中 → 送單間隔 1 秒 → 單張超過 30 項或正式單已達 50 張（同一步檢查）→ 每項可售與選項驗證 → 建立正式單（來源顧客）→ 寫歷史 → 發佈訂單送出。
+        內容雜湊：每品項為「菜單品項編號,數量,品項備註」，後接 `|` 與依編號排序的「選項編號:數量」（逗號連接）；品項間以 `;` 連接；最後加 `#` 與訂單備註；整串 SHA-256；請求編號不納入。
+        例：`12,2,少辣|5:1,8:1;30,1,|#不要香菜`。
+        新建立回 201；同請求編號且內容相同回 200 與原結果（過期後重送仍取得原結果）；同編號不同內容回 409 `DUPLICATE_REQUEST`。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CustomerOrderRequest'}}}
+      responses:
+        '200': {description: 重播（原結果）, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSubmitResult'}}}}
+        '201': {description: 已送單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSubmitResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '401': {$ref: '#/components/responses/E401'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 401: [SESSION_TOKEN_INVALID], 404: [MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, DUPLICATE_REQUEST, QR_EXPIRED, CHECKOUT_IN_PROGRESS, SESSION_PENDING_RECHECKOUT, CUSTOMER_ORDER_LIMIT, MENU_ITEM_NOT_SELLABLE, CONCURRENT_MODIFICATION], 429: [CUSTOMER_ORDER_TOO_FAST]}
+    get:
+      tags: [customer]
+      operationId: listCustomerOrders
+      summary: 查看本桌訂單與出餐狀態
+      description: 該用餐紀錄所有正式單（含服務員送的），已取消品項標示 `CANCELLED`。**不含**內部編號、版本、取消原因、價格。過期後仍可查看。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 訂單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerOrders'}}}}
+        '401': {$ref: '#/components/responses/E401'}
+      x-error-codes: {401: [SESSION_TOKEN_INVALID]}
+# @schemas
+    CustomerMenu:
+      type: object
+      required: [categories]
+      properties:
+        categories:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerCategory'}
+    CustomerCategory:
+      type: object
+      required: [id, name, items]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerMenuItem'}
+    CustomerMenuItem:
+      type: object
+      required: [id, name, price, modifierGroups]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        price: {$ref: '#/components/schemas/Money'}
+        imageKey: {type: string, nullable: true}
+        modifierGroups:
+          type: array
+          items: {$ref: '#/components/schemas/ModifierGroup'}
+    CustomerSession:
+      type: object
+      required: [sessionId, status, tableNo, qrExpiresAt, expired, canOrder, serviceChargeEnabled]
+      properties:
+        sessionId: {type: integer, format: int64}
+        status: {$ref: '#/components/schemas/SessionStatus'}
+        tableNo: {type: string}
+        qrExpiresAt: {type: string, format: date-time}
+        expired: {type: boolean}
+        canOrder: {type: boolean}
+        serviceChargeEnabled: {type: boolean}
+    CustomerOrderRequest:
+      type: object
+      required: [requestId, items]
+      properties:
+        requestId: {$ref: '#/components/schemas/RequestKey'}
+        items:
+          type: array
+          minItems: 1
+          description: 單張最多 30 項（超過回 CUSTOMER_ORDER_LIMIT，與正式單 50 張上限同一步檢查），所以此處不設 maxItems。
+          items: {$ref: '#/components/schemas/OrderItemInput'}
+        note: {type: string, maxLength: 255, default: ''}
+    CustomerSubmitResult:
+      type: object
+      required: [batchNo, itemCount, replayed]
+      properties:
+        batchNo: {type: integer}
+        itemCount: {type: integer}
+        replayed: {type: boolean}
+    CustomerOrders:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerOrder'}
+    CustomerOrder:
+      type: object
+      required: [batchNo, submittedAt, note, items]
+      properties:
+        batchNo: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        note: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerOrderItem'}
+    CustomerOrderItem:
+      type: object
+      required: [name, quantity, modifiers, note, status]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/KdsModifier'}
+        note: {type: string}
+        status: {$ref: '#/components/schemas/ItemStatus'}

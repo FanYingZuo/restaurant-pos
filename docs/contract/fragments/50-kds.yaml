@@ -1,0 +1,152 @@
+# @paths
+  /api/kds/stations/{station}/items:
+    get:
+      tags: [kds]
+      operationId: listStationItems
+      summary: 站別待處理與製作中品項清單
+      description: |
+        `station` 為 `K1` 或 `K2`；其他值回 404 `NOT_FOUND`。
+        清單規則：站別符合；待處理或製作中；屬於正式單；用餐紀錄為使用中，或**今天營業日已結束**（先付後吃）；已取消不列；依品項編號遞增。
+        一次查詢取回品項、選項、桌號，不在迴圈內逐筆查詢。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+      responses:
+        '200': {description: 清單, content: {application/json: {schema: {$ref: '#/components/schemas/KdsBoard'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [NOT_FOUND]}
+  /api/kds/stations/{station}/items/{orderItemId}/start:
+    post:
+      tags: [kds]
+      operationId: startItem
+      summary: 開始製作（待處理 → 製作中）
+      description: |
+        直接呼叫訂單模組的品項狀態服務。檢查依序：品項存在 → 站別符合 → 用餐紀錄使用中或已結束 → 未取消 → 版本相符 → 轉換合法。
+        廚房狀態變更**不檢查結帳旗標**；用餐紀錄已取消則拒絕。只發事件（推播），不寫列印。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionRequest'}}}
+      responses:
+        '200': {description: 已變更, content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [KDS_STATION_FORBIDDEN], 404: [NOT_FOUND, KDS_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, ORDER_ITEM_CANCELLED, CONCURRENT_MODIFICATION, INVALID_ORDER_ITEM_TRANSITION]}
+  /api/kds/stations/{station}/items/{orderItemId}/complete:
+    post:
+      tags: [kds]
+      operationId: completeItem
+      summary: 完成（待處理或製作中 → 已完成）
+      description: 規則同 `startItem`。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionRequest'}}}
+      responses:
+        '200': {description: 已變更, content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [KDS_STATION_FORBIDDEN], 404: [NOT_FOUND, KDS_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, ORDER_ITEM_CANCELLED, CONCURRENT_MODIFICATION, INVALID_ORDER_ITEM_TRANSITION]}
+  /ws:
+    get:
+      tags: [kds]
+      operationId: webSocketHandshake
+      summary: WebSocket（STOMP）端點
+      description: |
+        **這不是 REST 操作，僅用來在文件中記載 WebSocket 合約。** 原生 WebSocket（不用 SockJS）。
+
+        **連線**：HTTP 握手放行；裝置憑證放在 **STOMP CONNECT 帧的 `X-Device-Token` 標頭**，不放網址參數。CONNECT 時驗證，憑證缺少或無效 → 回 ERROR 帧並斷線。POS 與 KDS 皆可連線。來源（Origin）只允許公開基底網址。
+        **心跳**：伺服器每 25 秒送一次；**每次心跳重新檢查裝置**，裝置已撤銷則斷線。
+        **主題**（用戶端只訂閱，傳入訊息一律忽略）：`/topic/kds/K1`、`/topic/kds/K2`。
+        **訊息**（JSON，內容見 `KdsMessage`）：`ITEM_UPSERT`（品項新增或更新，完整資料）、`ITEM_REMOVE`（品項移除，只帶編號）、`BOARD_RELOAD`（整板重新載入）。
+        訊息對應事件見 01-PLAN §4.7：訂單送出／品項修改／品項開始製作 → `ITEM_UPSERT`；品項完成／品項取消 → `ITEM_REMOVE`；用餐取消、結束不收費 → 兩站各一則 `BOARD_RELOAD`。
+        推播在交易**提交後**執行，失敗只記日誌；監聽器重新讀取資料，讀不到就改送 `ITEM_REMOVE`。
+
+        **可靠性契約（前端必須遵守）**：至少送一次、不保證順序；以「`orderItemId` ＋ `version`」去重，只套用版本 ≥ 目前版本的更新，**移除一律套用**；斷線重連後整份重新載入（`listStationItems`）；每 60 秒定時對帳；60 秒沒收到任何訊息視為斷線。
+      responses:
+        '101': {description: 切換為 WebSocket}
+# @schemas
+    KdsModifier:
+      type: object
+      required: [name, quantity]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+    KdsItem:
+      type: object
+      required: [orderItemId, orderId, sessionId, tableNo, batchNo, name, quantity, note, modifiers, status, version, submittedAt, orderNote]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        orderId: {type: integer, format: int64}
+        sessionId: {type: integer, format: int64}
+        tableNo: {type: string}
+        batchNo: {type: integer}
+        name: {type: string}
+        quantity: {type: integer}
+        note: {type: string}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/KdsModifier'}
+        status:
+          type: string
+          enum: [PENDING, IN_PROGRESS]
+        version: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        orderNote: {type: string}
+    KdsBoard:
+      type: object
+      required: [station, items, generatedAt]
+      properties:
+        station: {$ref: '#/components/schemas/Station'}
+        generatedAt: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/KdsItem'}
+    KdsTransitionRequest:
+      type: object
+      required: [expectedVersion]
+      properties:
+        expectedVersion: {type: integer, description: 與目前版本不符回 CONCURRENT_MODIFICATION}
+    KdsTransitionResult:
+      type: object
+      required: [orderItemId, status, version]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        status: {$ref: '#/components/schemas/ItemStatus'}
+        version: {type: integer}
+    KdsMessage:
+      description: 推播訊息；以 `type` 區分。
+      oneOf:
+        - $ref: '#/components/schemas/KdsItemUpsert'
+        - $ref: '#/components/schemas/KdsItemRemove'
+        - $ref: '#/components/schemas/KdsBoardReload'
+      discriminator:
+        propertyName: type
+        mapping:
+          ITEM_UPSERT: '#/components/schemas/KdsItemUpsert'
+          ITEM_REMOVE: '#/components/schemas/KdsItemRemove'
+          BOARD_RELOAD: '#/components/schemas/KdsBoardReload'
+    KdsItemUpsert:
+      type: object
+      required: [type, item]
+      properties:
+        type: {type: string, enum: [ITEM_UPSERT]}
+        item: {$ref: '#/components/schemas/KdsItem'}
+    KdsItemRemove:
+      type: object
+      required: [type, orderItemId]
+      properties:
+        type: {type: string, enum: [ITEM_REMOVE]}
+        orderItemId: {type: integer, format: int64}
+    KdsBoardReload:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [BOARD_RELOAD]}

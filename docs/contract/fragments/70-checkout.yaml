@@ -1,0 +1,259 @@
+# @paths
+  /api/pos/payment-methods:
+    get:
+      tags: [checkout]
+      operationId: listPaymentMethods
+      summary: 付款方式清單
+      description: 依排序。本規劃只有現金（`CASH`）；停用的付款方式仍列出（`enabled` 為 false）。
+      responses:
+        '200': {description: 付款方式, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PaymentMethod'}}}}}
+  /api/pos/sessions/{sessionId}/checkout:
+    post:
+      tags: [checkout]
+      operationId: startCheckout
+      summary: 開始結帳
+      description: |
+        流程：鎖用餐紀錄 → 已有結帳中帳單就**直接回傳（200）** → 草稿有品項拒絕 → 沒有可結帳品項拒絕 → 建立帳單（**含未完成品項**）、計算服務費 → 結帳旗標為真（之後訂單、人數、服務費都被鎖住）→ 201。
+        服務費＝小計×費率，HALF_UP 到整數（995 → 100、986 → 99）；折扣欄位保留為 0。待重新結帳的用餐紀錄可正常開始結帳。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已有結帳中帳單（原帳單）, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '201': {description: 已建立帳單, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, UNSENT_ITEMS_EXIST, NOTHING_TO_CHECKOUT, CONCURRENT_MODIFICATION]}
+  /api/pos/checkouts/{checkoutId}/payments:
+    post:
+      tags: [checkout]
+      operationId: pay
+      summary: 付款（可部分付款）
+      description: |
+        流程：冪等（`paymentKey`）在狀態檢查之前 → 帳單必須結帳中 → 付款方式啟用且有處理器 → 實收 > 0 且為整數 → 先建待處理付款 → 伺服器計算未付並呼叫處理器（前端不傳未付）→
+        成功：記入帳與找零；已付 ≥ 總額就完成帳單、結束用餐紀錄、發佈結帳完成（列印收據）。
+        失敗：標記付款失敗，**交易仍提交**，回 409 `PAYMENT_FAILED`（唯一「回錯誤但資料已提交」的地方）。
+        現金入帳最多到未付，超出為找零；不足則付多少入多少，可再付。同時付足額只一筆完成、不超收。
+        同 `paymentKey` ＋同內容回目前帳單（200）；內容不同回 409 `PAYMENT_IDEMPOTENCY_CONFLICT`。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PayRequest'}}}
+      responses:
+        '200': {description: 目前帳單, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, PAYMENT_AMOUNT_INVALID], 404: [CHECKOUT_NOT_FOUND], 409: [PAYMENT_IDEMPOTENCY_CONFLICT, CHECKOUT_NOT_IN_PROGRESS, PAYMENT_METHOD_DISABLED, PAYMENT_FAILED, CONCURRENT_MODIFICATION]}
+  /api/pos/checkouts/{checkoutId}/payments/{paymentId}/refund:
+    post:
+      tags: [checkout]
+      operationId: refundPayment
+      summary: 退回付款（PIN）
+      description: 帳單結帳中、付款成功才可退回。狀態檢查之後驗 PIN 與理由 → 處理器作廢（失敗整筆回滾）→ 付款已退回、扣回已付與找零 → 寫稽核。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: paymentId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已退回（回傳帳單）, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [CHECKOUT_NOT_FOUND, NOT_FOUND], 409: [CHECKOUT_NOT_IN_PROGRESS, PAYMENT_NOT_REFUNDABLE, VOID_FAILED], 429: [PIN_LOCKED]}
+  /api/pos/checkouts/{checkoutId}/abandon:
+    post:
+      tags: [checkout]
+      operationId: abandonCheckout
+      summary: 放棄結帳
+      description: 還有成功付款就拒絕（須先退回）；帳單標記已放棄、紀錄全部保留、清除結帳旗標、寫稽核。不需 PIN。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已放棄, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND], 409: [CHECKOUT_NOT_IN_PROGRESS, CHECKOUT_HAS_PAYMENTS]}
+  /api/pos/checkouts/{checkoutId}/void:
+    post:
+      tags: [checkout]
+      operationId: voidCheckout
+      summary: 作廢帳單（PIN）
+      description: |
+        必須已完成且為**今天營業日**；驗 PIN 與理由 → 每筆成功付款呼叫處理器作廢（任一失敗整筆回滾）→ 帳單與付款已作廢 → 用餐紀錄重開（原桌空著占桌重開；被占或已刪除不占桌重開並標記待重新結帳）→ 發佈結帳作廢。之後依當下設定重新結帳。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已作廢, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [CHECKOUT_NOT_FOUND], 409: [CHECKOUT_NOT_VOIDABLE, CHECKOUT_VOID_NOT_SAME_DAY, VOID_FAILED], 429: [PIN_LOCKED]}
+  /api/pos/sessions/{sessionId}/close-without-payment:
+    post:
+      tags: [checkout]
+      operationId: closeWithoutPayment
+      summary: 結束不收費（PIN）
+      description: 只用於待重新結帳、且沒有結帳中帳單的用餐紀錄；PIN＋理由＋稽核，狀態改為已取消。不是待重新結帳回 409 `SESSION_NOT_OPEN`；有結帳中帳單回 409 `CHECKOUT_IN_PROGRESS`（先完成或放棄結帳）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已結束, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS], 429: [PIN_LOCKED]}
+  /api/pos/checkouts/{checkoutId}/receipt:
+    get:
+      tags: [checkout]
+      operationId: getReceiptPreview
+      summary: 收據預覽
+      description: |
+        任何狀態的帳單都可預覽；未完成時 `payments` 與 `change` 為 null（省略付款區塊）。`text` 為收據純文字（與列印同一個純函式產生；結帳時間以台北時間顯示）。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 收據, content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND]}
+# @schemas
+    CheckoutStatus:
+      type: string
+      description: 結帳中／已完成／已作廢／已放棄（前兩者佔「有效帳單」位置）
+      enum: [IN_PROGRESS, COMPLETED, VOIDED, ABANDONED]
+    PaymentStatus:
+      type: string
+      description: 待處理／成功／失敗／已作廢／已退回
+      enum: [PENDING, SUCCESS, FAILED, VOIDED, REFUNDED]
+    PaymentMethod:
+      type: object
+      required: [code, name, enabled, displayOrder]
+      properties:
+        code: {type: string, example: CASH}
+        name: {type: string}
+        enabled: {type: boolean}
+        displayOrder: {type: integer}
+    CheckoutLine:
+      type: object
+      required: [orderItemId, name, quantity, unitPrice, lineTotal, itemStatus, modifiers]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        name: {type: string}
+        quantity: {type: integer}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        itemStatus: {$ref: '#/components/schemas/ItemStatus'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+    CheckoutCharge:
+      type: object
+      required: [name, rate, amount]
+      properties:
+        name: {type: string, example: 服務費}
+        rate: {type: number, example: 0.1}
+        amount: {$ref: '#/components/schemas/Money'}
+    Payment:
+      type: object
+      required: [id, paymentKey, methodCode, receivedAmount, appliedAmount, changeAmount, status, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        paymentKey: {$ref: '#/components/schemas/RequestKey'}
+        methodCode: {type: string}
+        receivedAmount: {$ref: '#/components/schemas/Money'}
+        appliedAmount: {$ref: '#/components/schemas/Money'}
+        changeAmount: {$ref: '#/components/schemas/Money'}
+        status: {$ref: '#/components/schemas/PaymentStatus'}
+        createdAt: {type: string, format: date-time}
+    Checkout:
+      type: object
+      description: 已付、找零、未付由成功付款計算。
+      required: [id, sessionId, billNo, status, lines, subtotal, charges, discount, total, paid, change, unpaid, quickAmounts, payments, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        sessionId: {type: integer, format: int64}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        status: {$ref: '#/components/schemas/CheckoutStatus'}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutLine'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        charges:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutCharge'}
+        discount: {$ref: '#/components/schemas/Money'}
+        total: {$ref: '#/components/schemas/Money'}
+        paid: {$ref: '#/components/schemas/Money'}
+        change: {$ref: '#/components/schemas/Money'}
+        unpaid: {$ref: '#/components/schemas/Money'}
+        quickAmounts:
+          type: array
+          description: '{未付、向上取整到 100、500、1000} 去重排序（1096 → 1096、1100、1500、2000）；已付清為空列表'
+          items: {$ref: '#/components/schemas/Money'}
+        payments:
+          type: array
+          items: {$ref: '#/components/schemas/Payment'}
+        createdAt: {type: string, format: date-time}
+        completedAt: {type: string, format: date-time, nullable: true}
+    PayRequest:
+      type: object
+      required: [paymentKey, methodCode, receivedAmount]
+      properties:
+        paymentKey: {$ref: '#/components/schemas/RequestKey'}
+        methodCode: {type: string, maxLength: 32}
+        receivedAmount: {type: number, exclusiveMinimum: true, minimum: 0, description: 實收；必須為正整數，有小數回 PAYMENT_AMOUNT_INVALID（所以請求型別為 number）}
+    ReceiptLine:
+      type: object
+      required: [name, quantity, unitPrice, lineTotal, modifiers]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        modifiers:
+          type: array
+          items: {type: string}
+    ReceiptPayment:
+      type: object
+      required: [methodName, receivedAmount, appliedAmount]
+      properties:
+        methodName: {type: string}
+        receivedAmount: {$ref: '#/components/schemas/Money'}
+        appliedAmount: {$ref: '#/components/schemas/Money'}
+    Receipt:
+      type: object
+      required: [storeName, tableNo, billNo, status, lines, subtotal, charges, total, text]
+      properties:
+        storeName: {type: string, description: 未設定則為「餐廳」}
+        tableNo: {type: string}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        status: {$ref: '#/components/schemas/CheckoutStatus'}
+        completedAt: {type: string, format: date-time, nullable: true}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/ReceiptLine'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        charges:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutCharge'}
+        total: {$ref: '#/components/schemas/Money'}
+        payments:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ReceiptPayment'}
+        change: {type: integer, format: int64, nullable: true, description: 未完成時為 null}
+        text: {type: string, description: 收據純文字}

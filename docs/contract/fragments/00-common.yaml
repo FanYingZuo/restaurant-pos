@@ -1,0 +1,200 @@
+# @info
+openapi: 3.0.3
+info:
+  title: 餐廳 QR 點餐＋POS 系統 API 合約
+  version: 1.0.0
+  description: |
+    **狀態：已凍結 1.0.0（卡 1.7，使用者已確認）。變更需使用者同意並更新版本。** 規格來源：docs/plan/01-PLAN.md；本檔由 docs/contract/fragments/*.yaml 以 merge.sh 合併產生，請改片段檔，不要直接改本檔。
+
+    ## 通則（01-PLAN §4.4、§4.5、§4.8）
+    - JSON、欄位駝峰；成功直接回物件或陣列，不包外層；null 照樣輸出；ID 為數字；帳單號為三位數補零字串（如 "001"）。
+    - 時間為 ISO-8601 UTC 字串；營業日為 `yyyy-MM-dd`；金額為整數（元）；列舉為大寫字串。
+    - 字串先去頭尾空白；選填空白視為未提供；超長度上限回 `VALIDATION_ERROR`。
+    - 前端傳來的價格、小計、總額一律不採用，只接受品項 ID 與選項 ID。
+    - 分頁：`page`（預設 0，負數視為 0）、`size`（預設 10、最大 100）；回應含 `content`、`page`、`size`、`totalElements`、`totalPages`。
+
+    ## 路徑與裝置類型（§4.5）
+    | 路徑 | 認證 | 允許的裝置類型 |
+    | --- | --- | --- |
+    | `/api/pairing` | 無（唯一豁免裝置憑證的店內路徑），以來源 IP 防暴力 | — |
+    | `/api/staff/**`、`/api/pos/**` | `X-Device-Token` | POS |
+    | `/api/kds/**` | `X-Device-Token` | KDS |
+    | `/ws`（STOMP） | CONNECT 帧 `X-Device-Token` | KDS、POS |
+    | `/api/customer/menu`、`/api/customer/images/**` | 無 | — |
+    | `/api/customer/sessions/**` | `X-Session-Token` | — |
+
+    每個需裝置憑證的操作都可能回 401 `DEVICE_TOKEN_INVALID`、403 `DEVICE_TYPE_FORBIDDEN`、500 `INTERNAL_ERROR`，不在各操作重複列出。
+    每個有請求內容的操作都可能回 400 `VALIDATION_ERROR`。
+
+    ## 各操作的錯誤碼
+    每個操作的 `x-error-codes` 以「HTTP 狀態 → 錯誤碼清單」列出該操作可能回的業務錯誤碼；狀態碼只是粗分類，**前端一律看錯誤碼判斷**（§4.8）。列在同一狀態內的順序即「檢查順序」（規格有明訂順序者）。
+
+    ## 冪等（§4.6）
+    - 服務員送出草稿：`requestId`（Session 內唯一）；同編號回原結果，不論內容。
+    - 顧客送單：`requestId` ＋ 內容雜湊；同編號同內容回原結果；內容不同回 409 `DUPLICATE_REQUEST`。
+    - 付款：`paymentKey`（帳單內唯一）；同鍵同內容回目前帳單；內容不同回 409 `PAYMENT_IDEMPOTENCY_CONFLICT`。
+    - `requestId`、`paymentKey`：1～64 字，只允許英數字、底線、連字號。
+servers:
+  - url: http://localhost:8080
+    description: 開發環境（正式環境無 Swagger）
+security:
+  - DeviceToken: []
+tags:
+  - {name: pairing, description: 裝置配對（無需裝置憑證）}
+  - {name: staff, description: 員工、打卡、解鎖、出勤更正、稽核}
+  - {name: device, description: 裝置管理}
+  - {name: menu, description: 菜單管理}
+  - {name: table, description: 桌位與用餐紀錄}
+  - {name: order, description: 訂單}
+  - {name: kds, description: 廚房}
+  - {name: customer, description: 顧客端}
+  - {name: checkout, description: 結帳與付款}
+  - {name: report, description: 報表與日結}
+  - {name: print, description: 列印問題與重印}
+# @security
+    DeviceToken: {type: apiKey, in: header, name: X-Device-Token, description: 裝置憑證（配對時只回傳一次）}
+    UnlockToken: {type: apiKey, in: header, name: X-Unlock-Token, description: 管理者解鎖憑證（單一功能有效）}
+    SessionToken: {type: apiKey, in: header, name: X-Session-Token, description: '顧客 Session token（來自 QR 網址片段 #t=，不出現在任何 API 回應）'}
+# @responses
+    E400: {description: 格式或數值不合法, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E401: {description: 裝置憑證或顧客 token 無效, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E403: {description: 權限不足／PIN 錯誤／明確禁止, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E404: {description: 找不到, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E409: {description: 狀態衝突／重複請求／併發衝突, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E429: {description: 操作太頻繁或已被鎖定, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+# @schemas
+    ErrorResponse:
+      type: object
+      description: 錯誤回應只含錯誤碼、固定繁體中文訊息、時間戳，不含堆疊與機密值。
+      required: [code, message, timestamp]
+      properties:
+        code: {$ref: '#/components/schemas/ErrorCode'}
+        message: {type: string}
+        timestamp: {type: string, format: date-time}
+    ErrorCode:
+      type: string
+      description: 01-PLAN §4.8 錯誤碼全集；本表以外不得新增。`TABLE_UNAVAILABLE` 保留、本規劃不使用；`DEVICE_TOKEN_INVALID`、`DEVICE_TYPE_FORBIDDEN`、`INTERNAL_ERROR`、`METHOD_NOT_ALLOWED`、`UNSUPPORTED_MEDIA_TYPE` 為全域或框架層錯誤，不在各操作列出。
+      enum:
+        - VALIDATION_ERROR
+        - NOT_FOUND
+        - METHOD_NOT_ALLOWED
+        - UNSUPPORTED_MEDIA_TYPE
+        - FORBIDDEN
+        - CONCURRENT_MODIFICATION
+        - INTERNAL_ERROR
+        - DUPLICATE_REQUEST
+        - DEVICE_TOKEN_INVALID
+        - DEVICE_TYPE_FORBIDDEN
+        - PAIRING_CODE_INVALID
+        - PAIRING_LOCKED
+        - DEVICE_SELF_REVOKE
+        - INVALID_PIN
+        - PIN_LOCKED
+        - NOT_MANAGER
+        - ALREADY_CLOCKED_IN
+        - CLOCK_TOO_FAST
+        - EMPLOYEE_NOT_FOUND
+        - PIN_ALREADY_USED
+        - LAST_MANAGER
+        - SHIFT_CORRECTION_INVALID
+        - SHIFT_CORRECTION_TOO_OLD
+        - SHIFT_CORRECTION_SELF
+        - MENU_CATEGORY_NOT_FOUND
+        - MENU_CATEGORY_IN_USE
+        - MENU_ITEM_NOT_FOUND
+        - MENU_ITEM_NOT_ARCHIVED
+        - MENU_ITEM_NOT_SELLABLE
+        - MODIFIER_GROUP_NOT_FOUND
+        - MODIFIER_NOT_FOUND
+        - INVALID_PRICE
+        - INVALID_IMAGE
+        - INVALID_SORT_REQUEST
+        - TABLE_NOT_FOUND
+        - TABLE_NO_DUPLICATE
+        - TABLE_OCCUPIED
+        - TABLE_UNAVAILABLE
+        - SESSION_NOT_FOUND
+        - SESSION_NOT_OPEN
+        - SESSION_HAS_SUBMITTED_ORDERS
+        - SESSION_PENDING_RECHECKOUT
+        - QR_EXPIRED
+        - SESSION_TOKEN_INVALID
+        - CUSTOMER_ORDER_LIMIT
+        - CUSTOMER_ORDER_TOO_FAST
+        - INVALID_QUANTITY
+        - ORDER_NOT_FOUND
+        - ORDER_ITEM_NOT_FOUND
+        - ORDER_ITEM_CANCELLED
+        - ORDER_ITEM_ALREADY_READY
+        - INVALID_ORDER_ITEM_TRANSITION
+        - ORDER_NOT_EDITABLE
+        - EMPTY_DRAFT
+        - DRAFT_ITEM_NOT_FOUND
+        - INVALID_MODIFIER_SELECTION
+        - MODIFIER_GROUP_SELECTION_OUT_OF_RANGE
+        - MODIFIER_DUPLICATE_NOT_ALLOWED
+        - CHECKOUT_IN_PROGRESS
+        - UNSENT_ITEMS_EXIST
+        - NOTHING_TO_CHECKOUT
+        - CHECKOUT_NOT_FOUND
+        - CHECKOUT_NOT_IN_PROGRESS
+        - CHECKOUT_NOT_VOIDABLE
+        - CHECKOUT_VOID_NOT_SAME_DAY
+        - CHECKOUT_HAS_PAYMENTS
+        - PAYMENT_METHOD_DISABLED
+        - PAYMENT_AMOUNT_INVALID
+        - PAYMENT_FAILED
+        - PAYMENT_IDEMPOTENCY_CONFLICT
+        - PAYMENT_NOT_REFUNDABLE
+        - VOID_FAILED
+        - KDS_STATION_FORBIDDEN
+        - KDS_ITEM_NOT_FOUND
+        - INVALID_DATE_RANGE
+        - DAY_CLOSE_FUTURE_DATE
+        - PRINT_JOB_NOT_FOUND
+    PageInfo:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: {type: integer, minimum: 0}
+        size: {type: integer, minimum: 1, maximum: 100}
+        totalElements: {type: integer, format: int64}
+        totalPages: {type: integer}
+    Pin:
+      type: string
+      pattern: '^[0-9]{4,6}$'
+      description: 4～6 位數字。機密：不得出現在日誌、回應、測試快照。
+    Reason:
+      type: string
+      minLength: 1
+      maxLength: 255
+    RequestKey:
+      type: string
+      pattern: '^[A-Za-z0-9_-]{1,64}$'
+    Money:
+      type: integer
+      format: int64
+      description: 整數元。
+    BillNo:
+      type: string
+      pattern: '^[0-9]{3,}$'
+      description: 帳單號，三位數補零字串。
+    PinRequest:
+      type: object
+      required: [pin]
+      properties:
+        pin: {$ref: '#/components/schemas/Pin'}
+    PinReasonRequest:
+      type: object
+      required: [pin, reason]
+      properties:
+        pin: {$ref: '#/components/schemas/Pin'}
+        reason: {$ref: '#/components/schemas/Reason'}
+    ReorderRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          items: {type: integer, format: int64}
+          description: 必須剛好等於該層所有未刪除項目；依位置從 0 重新編號。

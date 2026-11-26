@@ -1,0 +1,409 @@
+# @paths
+  /api/pos/menu:
+    get:
+      tags: [menu]
+      operationId: getMenuTree
+      summary: 完整菜單樹（管理與點餐用）
+      description: |
+        分類 → 品項 → 選項群組 → 選項，皆依顯示順序，只含未刪除項目（含下架的分類與品項）。
+        品項的 `sellable` 為查詢時計算：品項上架、分類上架、售完日不是今天、每個群組的選項數 ≥ 最少可選。
+        POS 點餐畫面以 `sellable` 決定是否可選；顧客菜單另見 `getCustomerMenu`。
+      responses:
+        '200': {description: 菜單樹, content: {application/json: {schema: {$ref: '#/components/schemas/MenuTree'}}}}
+  /api/pos/menu/categories:
+    post:
+      tags: [menu]
+      operationId: createCategory
+      summary: 新增分類
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CategoryCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/MenuCategory'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR]}
+  /api/pos/menu/categories/{categoryId}:
+    patch:
+      tags: [menu]
+      operationId: updateCategory
+      summary: 修改分類（含上下架）
+      description: 分類下仍有上架品項時不可下架。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CategoryUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuCategory'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MENU_CATEGORY_NOT_FOUND], 409: [MENU_CATEGORY_IN_USE]}
+    delete:
+      tags: [menu]
+      operationId: deleteCategory
+      summary: 刪除分類（軟刪除）
+      description: 分類下仍有（未刪除）品項不可刪。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [MENU_CATEGORY_NOT_FOUND], 409: [MENU_CATEGORY_IN_USE]}
+  /api/pos/menu/categories/order:
+    put:
+      tags: [menu]
+      operationId: reorderCategories
+      summary: 分類排序
+      description: 提交的編號列表必須剛好等於所有未刪除分類；依位置從 0 重新編號。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST]}
+  /api/pos/menu/categories/{categoryId}/items/order:
+    put:
+      tags: [menu]
+      operationId: reorderItems
+      summary: 分類內品項排序
+      description: 列表必須剛好等於該分類所有未刪除品項。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MENU_CATEGORY_NOT_FOUND]}
+  /api/pos/menu/items:
+    post:
+      tags: [menu]
+      operationId: createItem
+      summary: 新增品項
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ItemCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MENU_CATEGORY_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}:
+    patch:
+      tags: [menu]
+      operationId: updateItem
+      summary: 修改品項（含改價、上下架）
+      description: 改價寫稽核；改價改名不影響既有訂單。重新上架不清除售完日。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ItemUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteItem
+      summary: 刪除品項（軟刪除）
+      description: 需先下架才可刪。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND], 409: [MENU_ITEM_NOT_ARCHIVED]}
+  /api/pos/menu/items/{itemId}/sold-out:
+    post:
+      tags: [menu]
+      operationId: markItemSoldOut
+      summary: 設為售完（今天營業日）
+      description: 隔日自動恢復。已售完時重複呼叫回目前狀態。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已設定, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: clearItemSoldOut
+      summary: 手動恢復供應
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已恢復, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/modifier-groups:
+    post:
+      tags: [menu]
+      operationId: createModifierGroup
+      summary: 新增選項群組
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroupCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroup'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/modifier-groups/order:
+    put:
+      tags: [menu]
+      operationId: reorderModifierGroups
+      summary: 品項內選項群組排序
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}:
+    patch:
+      tags: [menu]
+      operationId: updateModifierGroup
+      summary: 修改選項群組
+      description: 最少 ≤ 最多。
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroupUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroup'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MODIFIER_GROUP_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteModifierGroup
+      summary: 刪除選項群組（連同選項軟刪除）
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}/modifiers:
+    post:
+      tags: [menu]
+      operationId: createModifier
+      summary: 新增選項
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/Modifier'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}/modifiers/order:
+    put:
+      tags: [menu]
+      operationId: reorderModifiers
+      summary: 群組內選項排序
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifiers/{modifierId}:
+    patch:
+      tags: [menu]
+      operationId: updateModifier
+      summary: 修改選項（含加價）
+      description: 加價變更寫稽核。
+      parameters:
+        - {name: modifierId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/Modifier'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MODIFIER_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteModifier
+      summary: 刪除選項（軟刪除）
+      parameters:
+        - {name: modifierId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MODIFIER_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/image:
+    put:
+      tags: [menu]
+      operationId: uploadItemImage
+      summary: 上傳品項圖片
+      description: |
+        檔案 ≤ 2 MB；以檔案開頭位元組判斷 JPEG／PNG（不信任副檔名與內容類型）；先讀標頭寬高，超過 4000 像素拒絕，再完整解碼；重新編碼後儲存、去除 EXIF；
+        新圖儲存成功後才刪舊檔。成功回傳的 `imageKey` 以 `getMenuImage` 取圖。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_IMAGE], 404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteItemImage
+      summary: 刪除品項圖片
+      description: 刪檔失敗只記日誌，不影響結果。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已刪除, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+# @schemas
+    Station:
+      type: string
+      description: 站別只有 K1、K2（D-11）。
+      enum: [K1, K2]
+    MenuTree:
+      type: object
+      required: [categories]
+      properties:
+        categories:
+          type: array
+          items: {$ref: '#/components/schemas/MenuCategory'}
+    MenuCategory:
+      type: object
+      required: [id, name, displayOrder, active, items]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999}
+        active: {type: boolean}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/MenuItem'}
+    MenuItem:
+      type: object
+      required: [id, categoryId, name, price, station, active, soldOut, sellable, displayOrder, modifierGroups]
+      properties:
+        id: {type: integer, format: int64}
+        categoryId: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean}
+        soldOutBusinessDate: {type: string, format: date, nullable: true, description: 售完營業日；重新上架不清除}
+        soldOut: {type: boolean, description: 售完營業日等於今天營業日}
+        sellable: {type: boolean, description: 查詢時計算（四個條件）}
+        imageKey: {type: string, nullable: true}
+        displayOrder: {type: integer}
+        modifierGroups:
+          type: array
+          items: {$ref: '#/components/schemas/ModifierGroup'}
+    ModifierGroup:
+      type: object
+      required: [id, name, minSelect, maxSelect, allowDuplicate, displayOrder, modifiers]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean, description: 是否允許同一選項重複（數量 >1）}
+        displayOrder: {type: integer}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/Modifier'}
+    Modifier:
+      type: object
+      required: [id, name, priceDelta, displayOrder]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {$ref: '#/components/schemas/Money'}
+        displayOrder: {type: integer}
+    CategoryCreate:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999, description: 省略則排在最後}
+        active: {type: boolean, default: true}
+    CategoryUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999}
+        active: {type: boolean}
+    ItemCreate:
+      type: object
+      required: [categoryId, name, price, station]
+      properties:
+        categoryId: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {type: number, minimum: 0, maximum: 9999999, description: 必須為整數；有小數回 INVALID_PRICE（所以請求型別為 number）}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean, default: false}
+    ItemUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {type: number, minimum: 0, maximum: 9999999, description: 同 ItemCreate.price}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean}
+    ModifierGroupCreate:
+      type: object
+      required: [name, minSelect, maxSelect]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean, default: false}
+    ModifierGroupUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean}
+    ModifierCreate:
+      type: object
+      required: [name, priceDelta]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {type: number, minimum: 0, maximum: 9999999, description: 必須為整數，0 允許；有小數回 INVALID_PRICE}
+    ModifierUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {type: number, minimum: 0, maximum: 9999999}

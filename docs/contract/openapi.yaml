@@ -1,0 +1,2463 @@
+openapi: 3.0.3
+info:
+  title: 餐廳 QR 點餐＋POS 系統 API 合約
+  version: 1.0.0
+  description: |
+    **狀態：已凍結 1.0.0（卡 1.7，使用者已確認）。變更需使用者同意並更新版本。** 規格來源：docs/plan/01-PLAN.md；本檔由 docs/contract/fragments/*.yaml 以 merge.sh 合併產生，請改片段檔，不要直接改本檔。
+
+    ## 通則（01-PLAN §4.4、§4.5、§4.8）
+    - JSON、欄位駝峰；成功直接回物件或陣列，不包外層；null 照樣輸出；ID 為數字；帳單號為三位數補零字串（如 "001"）。
+    - 時間為 ISO-8601 UTC 字串；營業日為 `yyyy-MM-dd`；金額為整數（元）；列舉為大寫字串。
+    - 字串先去頭尾空白；選填空白視為未提供；超長度上限回 `VALIDATION_ERROR`。
+    - 前端傳來的價格、小計、總額一律不採用，只接受品項 ID 與選項 ID。
+    - 分頁：`page`（預設 0，負數視為 0）、`size`（預設 10、最大 100）；回應含 `content`、`page`、`size`、`totalElements`、`totalPages`。
+
+    ## 路徑與裝置類型（§4.5）
+    | 路徑 | 認證 | 允許的裝置類型 |
+    | --- | --- | --- |
+    | `/api/pairing` | 無（唯一豁免裝置憑證的店內路徑），以來源 IP 防暴力 | — |
+    | `/api/staff/**`、`/api/pos/**` | `X-Device-Token` | POS |
+    | `/api/kds/**` | `X-Device-Token` | KDS |
+    | `/ws`（STOMP） | CONNECT 帧 `X-Device-Token` | KDS、POS |
+    | `/api/customer/menu`、`/api/customer/images/**` | 無 | — |
+    | `/api/customer/sessions/**` | `X-Session-Token` | — |
+
+    每個需裝置憑證的操作都可能回 401 `DEVICE_TOKEN_INVALID`、403 `DEVICE_TYPE_FORBIDDEN`、500 `INTERNAL_ERROR`，不在各操作重複列出。
+    每個有請求內容的操作都可能回 400 `VALIDATION_ERROR`。
+
+    ## 各操作的錯誤碼
+    每個操作的 `x-error-codes` 以「HTTP 狀態 → 錯誤碼清單」列出該操作可能回的業務錯誤碼；狀態碼只是粗分類，**前端一律看錯誤碼判斷**（§4.8）。列在同一狀態內的順序即「檢查順序」（規格有明訂順序者）。
+
+    ## 冪等（§4.6）
+    - 服務員送出草稿：`requestId`（Session 內唯一）；同編號回原結果，不論內容。
+    - 顧客送單：`requestId` ＋ 內容雜湊；同編號同內容回原結果；內容不同回 409 `DUPLICATE_REQUEST`。
+    - 付款：`paymentKey`（帳單內唯一）；同鍵同內容回目前帳單；內容不同回 409 `PAYMENT_IDEMPOTENCY_CONFLICT`。
+    - `requestId`、`paymentKey`：1～64 字，只允許英數字、底線、連字號。
+servers:
+  - url: http://localhost:8080
+    description: 開發環境（正式環境無 Swagger）
+security:
+  - DeviceToken: []
+tags:
+  - {name: pairing, description: 裝置配對（無需裝置憑證）}
+  - {name: staff, description: 員工、打卡、解鎖、出勤更正、稽核}
+  - {name: device, description: 裝置管理}
+  - {name: menu, description: 菜單管理}
+  - {name: table, description: 桌位與用餐紀錄}
+  - {name: order, description: 訂單}
+  - {name: kds, description: 廚房}
+  - {name: customer, description: 顧客端}
+  - {name: checkout, description: 結帳與付款}
+  - {name: report, description: 報表與日結}
+  - {name: print, description: 列印問題與重印}
+paths:
+  /api/pairing:
+    post:
+      tags: [pairing]
+      operationId: pairDevice
+      summary: 以配對碼取得裝置憑證
+      description: |
+        **唯一豁免裝置憑證的店內路徑**（Security 設定須明列）。配對碼一次性、10 分鐘有效；憑證 `deviceToken` **只在本回應出現一次**，配對碼立即失效。
+        錯誤不區分「不存在」「已過期」「已使用」。防暴力以來源 IP 計算：10 分鐘內錯 10 次鎖 10 分鐘。
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PairRequest'}}}
+      responses:
+        '200': {description: 配對成功, content: {application/json: {schema: {$ref: '#/components/schemas/PairResponse'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [PAIRING_CODE_INVALID], 429: [PAIRING_LOCKED]}
+  /api/staff/clock-in:
+    post:
+      tags: [staff]
+      operationId: clockIn
+      summary: 上班打卡（PIN）
+      description: 兩次打卡至少間隔 60 秒；上班中不能再上班。前一營業日忘記下班 → 該班記為「下班未打卡」，不計工時、不擋今天打卡。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinRequest'}}}
+      responses:
+        '200': {description: 打卡成功, content: {application/json: {schema: {$ref: '#/components/schemas/ClockResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 409: [ALREADY_CLOCKED_IN], 429: [PIN_LOCKED, CLOCK_TOO_FAST]}
+  /api/staff/clock-out:
+    post:
+      tags: [staff]
+      operationId: clockOut
+      summary: 下班打卡（PIN）
+      description: 沒上班就下班 → 另記一筆「上班未打卡」班次，不計工時。分鐘數無條件捨去。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinRequest'}}}
+      responses:
+        '200': {description: 打卡成功, content: {application/json: {schema: {$ref: '#/components/schemas/ClockResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 429: [PIN_LOCKED, CLOCK_TOO_FAST]}
+  /api/staff/clock-status:
+    post:
+      tags: [staff]
+      operationId: getClockStatus
+      summary: 查詢打卡狀態（只驗 PIN，不打卡）
+      description: 使用 POST 是為了 PIN 放在請求內容而非網址。不受 60 秒間隔限制。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinRequest'}}}
+      responses:
+        '200': {description: 目前狀態, content: {application/json: {schema: {$ref: '#/components/schemas/ClockResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 429: [PIN_LOCKED]}
+  /api/staff/clock-history:
+    get:
+      tags: [staff]
+      operationId: getClockHistory
+      summary: 打卡歷史
+      description: 天數以營業日計，含今天往前算。需管理者解鎖（EMPLOYEE_MANAGE）。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: employeeId, in: query, required: false, schema: {type: integer, format: int64}}
+        - {name: days, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 31, default: 2}}
+      responses:
+        '200': {description: 班次清單（新到舊）, content: {application/json: {schema: {$ref: '#/components/schemas/ClockHistory'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '403': {$ref: '#/components/responses/E403'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 404: [EMPLOYEE_NOT_FOUND]}
+  /api/staff/unlock:
+    post:
+      tags: [staff]
+      operationId: unlock
+      summary: 管理者解鎖（管理者 PIN 換單一功能憑證）
+      description: |
+        憑證為 32 位元組隨機值（網址安全 base64），只對 `function` 有效；閒置 30 分鐘、解鎖者停用或不再是管理者、服務重啟、呼叫釋放 API 時失效。寫稽核。
+        後續請求帶 `X-Unlock-Token`；憑證缺少、無效、已失效、或功能不符，一律回 403 `FORBIDDEN`。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UnlockRequest'}}}
+      responses:
+        '200': {description: 解鎖成功, content: {application/json: {schema: {$ref: '#/components/schemas/UnlockResponse'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN, NOT_MANAGER], 429: [PIN_LOCKED]}
+    delete:
+      tags: [staff]
+      operationId: releaseUnlock
+      summary: 釋放解鎖憑證（離開管控頁面時呼叫）
+      description: 冪等；憑證已失效或不存在也回 204。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      responses:
+        '204': {description: 已釋放}
+  /api/staff/employees:
+    get:
+      tags: [staff]
+      operationId: listEmployees
+      summary: 員工列表（EMPLOYEE_MANAGE）
+      description: 不回 PIN 或其雜湊。含已停用員工。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      responses:
+        '200': {description: 員工, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Employee'}}}}}
+        '403': {$ref: '#/components/responses/E403'}
+      x-error-codes: {403: [FORBIDDEN]}
+    post:
+      tags: [staff]
+      operationId: createEmployee
+      summary: 新增員工（EMPLOYEE_MANAGE）
+      description: PIN 4～6 位數字，全店唯一（只比對在職員工）。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EmployeeCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/Employee'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 409: [PIN_ALREADY_USED]}
+  /api/staff/employees/{employeeId}:
+    patch:
+      tags: [staff]
+      operationId: updateEmployee
+      summary: 改名與角色（EMPLOYEE_MANAGE）
+      description: 至少保留一位在職管理者；降級最後一位管理者回 `LAST_MANAGER`。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: employeeId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EmployeeUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/Employee'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 404: [EMPLOYEE_NOT_FOUND], 409: [LAST_MANAGER]}
+  /api/staff/employees/{employeeId}/pin:
+    put:
+      tags: [staff]
+      operationId: changeEmployeePin
+      summary: 換 PIN（EMPLOYEE_MANAGE）
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: employeeId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinRequest'}}}
+      responses:
+        '204': {description: 已更換}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 404: [EMPLOYEE_NOT_FOUND], 409: [PIN_ALREADY_USED]}
+  /api/staff/employees/{employeeId}/deactivate:
+    post:
+      tags: [staff]
+      operationId: deactivateEmployee
+      summary: 停用員工（EMPLOYEE_MANAGE）
+      description: 軟刪除；清空 PIN 雜湊；最後一位在職管理者不可停用。停用後驗 PIN 回 `INVALID_PIN`，不洩漏「已停用」。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: employeeId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已停用, content: {application/json: {schema: {$ref: '#/components/schemas/Employee'}}}}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {403: [FORBIDDEN], 404: [EMPLOYEE_NOT_FOUND], 409: [LAST_MANAGER]}
+  /api/staff/shifts:
+    post:
+      tags: [staff]
+      operationId: createShift
+      summary: 出勤更正：新增完整班次（EMPLOYEE_MANAGE）
+      description: |
+        理由必填；下班晚於上班且不晚於現在；限 31 天內；不能改自己的班次（唯一管理者例外）；寫更正歷史與稽核；班次標記「已更正」。
+        更正者為持有解鎖憑證的管理者。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ShiftCreate'}}}
+      responses:
+        '201': {description: 已新增, content: {application/json: {schema: {$ref: '#/components/schemas/ShiftRecord'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, SHIFT_CORRECTION_INVALID, SHIFT_CORRECTION_TOO_OLD], 403: [FORBIDDEN, SHIFT_CORRECTION_SELF], 404: [EMPLOYEE_NOT_FOUND]}
+  /api/staff/shifts/{shiftId}:
+    patch:
+      tags: [staff]
+      operationId: correctShift
+      summary: 出勤更正：補上班或下班時間、修改既有班次（EMPLOYEE_MANAGE）
+      description: 規則同新增；班次不提供刪除。`shiftId` 來自打卡歷史。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: shiftId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ShiftUpdate'}}}
+      responses:
+        '200': {description: 已更正, content: {application/json: {schema: {$ref: '#/components/schemas/ShiftRecord'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, SHIFT_CORRECTION_INVALID, SHIFT_CORRECTION_TOO_OLD], 403: [FORBIDDEN, SHIFT_CORRECTION_SELF], 404: [NOT_FOUND]}
+  /api/staff/audit-logs:
+    get:
+      tags: [staff]
+      operationId: listAuditLogs
+      summary: 稽核查詢（EMPLOYEE_MANAGE）
+      description: 依日期（營業日）與動作篩選；預設依 ID 遞增。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: from, in: query, required: false, schema: {type: string, format: date}}
+        - {name: to, in: query, required: false, schema: {type: string, format: date}}
+        - {name: action, in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: page, in: query, required: false, schema: {type: integer, default: 0}}
+        - {name: size, in: query, required: false, schema: {type: integer, default: 10, maximum: 100}}
+      responses:
+        '200': {description: 稽核紀錄, content: {application/json: {schema: {$ref: '#/components/schemas/AuditLogPage'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_DATE_RANGE], 403: [FORBIDDEN]}
+  /api/staff/devices:
+    get:
+      tags: [device]
+      operationId: listDevices
+      summary: 裝置列表（DEVICE_MANAGE）
+      description: 不回憑證、憑證雜湊或配對碼。含已撤銷裝置。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      responses:
+        '200': {description: 裝置, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Device'}}}}}
+        '403': {$ref: '#/components/responses/E403'}
+      x-error-codes: {403: [FORBIDDEN]}
+    post:
+      tags: [device]
+      operationId: createDevice
+      summary: 建立裝置並取得配對碼（DEVICE_MANAGE）
+      description: 配對碼 8 位英數字、10 分鐘有效，**只在本回應出現**。寫稽核。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/DeviceCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/DevicePairing'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN]}
+  /api/staff/devices/{deviceId}/pairing-code:
+    post:
+      tags: [device]
+      operationId: regeneratePairingCode
+      summary: 重新產生配對碼（DEVICE_MANAGE）
+      description: 舊配對碼立即失效。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: deviceId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 新配對碼, content: {application/json: {schema: {$ref: '#/components/schemas/DevicePairing'}}}}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {403: [FORBIDDEN], 404: [NOT_FOUND]}
+  /api/staff/devices/{deviceId}/revoke:
+    post:
+      tags: [device]
+      operationId: revokeDevice
+      summary: 撤銷裝置（DEVICE_MANAGE）
+      description: 立即生效（WebSocket 下次心跳斷線）；不可撤銷自己正在用的裝置；寫稽核。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: deviceId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已撤銷, content: {application/json: {schema: {$ref: '#/components/schemas/Device'}}}}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {403: [FORBIDDEN, DEVICE_SELF_REVOKE], 404: [NOT_FOUND]}
+  /api/pos/menu:
+    get:
+      tags: [menu]
+      operationId: getMenuTree
+      summary: 完整菜單樹（管理與點餐用）
+      description: |
+        分類 → 品項 → 選項群組 → 選項，皆依顯示順序，只含未刪除項目（含下架的分類與品項）。
+        品項的 `sellable` 為查詢時計算：品項上架、分類上架、售完日不是今天、每個群組的選項數 ≥ 最少可選。
+        POS 點餐畫面以 `sellable` 決定是否可選；顧客菜單另見 `getCustomerMenu`。
+      responses:
+        '200': {description: 菜單樹, content: {application/json: {schema: {$ref: '#/components/schemas/MenuTree'}}}}
+  /api/pos/menu/categories:
+    post:
+      tags: [menu]
+      operationId: createCategory
+      summary: 新增分類
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CategoryCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/MenuCategory'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR]}
+  /api/pos/menu/categories/{categoryId}:
+    patch:
+      tags: [menu]
+      operationId: updateCategory
+      summary: 修改分類（含上下架）
+      description: 分類下仍有上架品項時不可下架。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CategoryUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuCategory'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MENU_CATEGORY_NOT_FOUND], 409: [MENU_CATEGORY_IN_USE]}
+    delete:
+      tags: [menu]
+      operationId: deleteCategory
+      summary: 刪除分類（軟刪除）
+      description: 分類下仍有（未刪除）品項不可刪。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [MENU_CATEGORY_NOT_FOUND], 409: [MENU_CATEGORY_IN_USE]}
+  /api/pos/menu/categories/order:
+    put:
+      tags: [menu]
+      operationId: reorderCategories
+      summary: 分類排序
+      description: 提交的編號列表必須剛好等於所有未刪除分類；依位置從 0 重新編號。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST]}
+  /api/pos/menu/categories/{categoryId}/items/order:
+    put:
+      tags: [menu]
+      operationId: reorderItems
+      summary: 分類內品項排序
+      description: 列表必須剛好等於該分類所有未刪除品項。
+      parameters:
+        - {name: categoryId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MENU_CATEGORY_NOT_FOUND]}
+  /api/pos/menu/items:
+    post:
+      tags: [menu]
+      operationId: createItem
+      summary: 新增品項
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ItemCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MENU_CATEGORY_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}:
+    patch:
+      tags: [menu]
+      operationId: updateItem
+      summary: 修改品項（含改價、上下架）
+      description: 改價寫稽核；改價改名不影響既有訂單。重新上架不清除售完日。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ItemUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteItem
+      summary: 刪除品項（軟刪除）
+      description: 需先下架才可刪。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND], 409: [MENU_ITEM_NOT_ARCHIVED]}
+  /api/pos/menu/items/{itemId}/sold-out:
+    post:
+      tags: [menu]
+      operationId: markItemSoldOut
+      summary: 設為售完（今天營業日）
+      description: 隔日自動恢復。已售完時重複呼叫回目前狀態。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已設定, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: clearItemSoldOut
+      summary: 手動恢復供應
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已恢復, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/modifier-groups:
+    post:
+      tags: [menu]
+      operationId: createModifierGroup
+      summary: 新增選項群組
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroupCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroup'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/modifier-groups/order:
+    put:
+      tags: [menu]
+      operationId: reorderModifierGroups
+      summary: 品項內選項群組排序
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}:
+    patch:
+      tags: [menu]
+      operationId: updateModifierGroup
+      summary: 修改選項群組
+      description: 最少 ≤ 最多。
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroupUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/ModifierGroup'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [MODIFIER_GROUP_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteModifierGroup
+      summary: 刪除選項群組（連同選項軟刪除）
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}/modifiers:
+    post:
+      tags: [menu]
+      operationId: createModifier
+      summary: 新增選項
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/Modifier'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifier-groups/{groupId}/modifiers/order:
+    put:
+      tags: [menu]
+      operationId: reorderModifiers
+      summary: 群組內選項排序
+      parameters:
+        - {name: groupId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReorderRequest'}}}
+      responses:
+        '204': {description: 已排序}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_SORT_REQUEST], 404: [MODIFIER_GROUP_NOT_FOUND]}
+  /api/pos/menu/modifiers/{modifierId}:
+    patch:
+      tags: [menu]
+      operationId: updateModifier
+      summary: 修改選項（含加價）
+      description: 加價變更寫稽核。
+      parameters:
+        - {name: modifierId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifierUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/Modifier'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_PRICE], 404: [MODIFIER_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteModifier
+      summary: 刪除選項（軟刪除）
+      parameters:
+        - {name: modifierId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MODIFIER_NOT_FOUND]}
+  /api/pos/menu/items/{itemId}/image:
+    put:
+      tags: [menu]
+      operationId: uploadItemImage
+      summary: 上傳品項圖片
+      description: |
+        檔案 ≤ 2 MB；以檔案開頭位元組判斷 JPEG／PNG（不信任副檔名與內容類型）；先讀標頭寬高，超過 4000 像素拒絕，再完整解碼；重新編碼後儲存、去除 EXIF；
+        新圖儲存成功後才刪舊檔。成功回傳的 `imageKey` 以 `getMenuImage` 取圖。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [INVALID_IMAGE], 404: [MENU_ITEM_NOT_FOUND]}
+    delete:
+      tags: [menu]
+      operationId: deleteItemImage
+      summary: 刪除品項圖片
+      description: 刪檔失敗只記日誌，不影響結果。
+      parameters:
+        - {name: itemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已刪除, content: {application/json: {schema: {$ref: '#/components/schemas/MenuItem'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [MENU_ITEM_NOT_FOUND]}
+  /api/pos/tables:
+    get:
+      tags: [table]
+      operationId: listTables
+      summary: 桌位版面與目前用餐狀態（桌位看板）
+      description: |
+        依桌號自然排序（A2 在 A10 前），不含已刪除桌位。每桌帶「目前占桌的使用中用餐紀錄」摘要（無則為 null）。
+        看板上的小計不在本回應（table 模組不依賴 order）；需要時以 `getSessionDetail` 取得。
+      responses:
+        '200': {description: 桌位, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/TableView'}}}}}
+    post:
+      tags: [table]
+      operationId: createTable
+      summary: 新增桌位（TABLE_LAYOUT）
+      description: 桌號去空白後不分大小寫唯一。方形與圓形的高度必須等於寬度，送了不同寬高回 `VALIDATION_ERROR`，不自動修正。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TableCreate'}}}
+      responses:
+        '201': {description: 已建立, content: {application/json: {schema: {$ref: '#/components/schemas/TableLayout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 409: [TABLE_NO_DUPLICATE]}
+  /api/pos/tables/{tableId}:
+    patch:
+      tags: [table]
+      operationId: updateTable
+      summary: 修改桌位（TABLE_LAYOUT）
+      description: 使用中的桌位不可編輯。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TableUpdate'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/TableLayout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [FORBIDDEN], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED, TABLE_NO_DUPLICATE]}
+    delete:
+      tags: [table]
+      operationId: deleteTable
+      summary: 刪除桌位（TABLE_LAYOUT，軟刪除）
+      description: 使用中的桌位不可刪除。
+      security:
+        - DeviceToken: []
+          UnlockToken: []
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '204': {description: 已刪除}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {403: [FORBIDDEN], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED]}
+  /api/pos/tables/{tableId}/open:
+    post:
+      tags: [table]
+      operationId: openTable
+      summary: 開桌
+      description: |
+        流程：鎖桌位 → 檢查未使用 → 鎖並遞增當日流水 → 建立用餐紀錄（token、QR 到期＝開桌＋4 小時、服務費預設值）→ 桌位使用中 → 發佈用餐開始。
+        **回應不含 token**；token 只在 QR 圖片（`getSessionQr`）與 QR 列印單。同時開同一桌只一個成功，其餘回 409。
+      parameters:
+        - {name: tableId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OpenTableRequest'}}}
+      responses:
+        '201': {description: 已開桌, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [TABLE_NOT_FOUND], 409: [TABLE_OCCUPIED, CONCURRENT_MODIFICATION]}
+  /api/pos/sessions/pending-recheckout:
+    get:
+      tags: [table]
+      operationId: listPendingRecheckout
+      summary: 待重新結帳的用餐紀錄清單
+      description: 作廢後重開且原桌已被占用或已刪除（不占桌重開）的用餐紀錄。
+      responses:
+        '200': {description: 清單, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SessionSummary'}}}}}
+  /api/pos/sessions/{sessionId}/qr:
+    get:
+      tags: [table]
+      operationId: getSessionQr
+      summary: 取得顧客點餐 QR 圖片
+      description: |
+        網址＝公開基底網址（去結尾斜線）＋ `/customer/order/` ＋ 用餐紀錄編號 ＋ `#t=` token。
+        只有「使用中」可取得；QR 有效期在查詢時判斷（過期仍可取得圖片，但顧客不能送新單）。
+        需裝置憑證標頭，前端須以程式取得 blob 後顯示（不能直接用 img 標籤）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200':
+          description: PNG 圖片
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Cache-Control: {schema: {type: string, example: 'no-store'}}
+          content:
+            image/png: {schema: {type: string, format: binary}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN]}
+  /api/pos/sessions/{sessionId}/guest-count:
+    patch:
+      tags: [table]
+      operationId: updateGuestCount
+      summary: 修改人數
+      description: 用餐紀錄須使用中且非結帳中；待重新結帳的不可改。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OpenTableRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS]}
+  /api/pos/sessions/{sessionId}/service-charge:
+    put:
+      tags: [table]
+      operationId: setServiceCharge
+      summary: 服務費開關（PIN，寫稽核）
+      description: 條件同修改人數。依 §4.4「狀態檢查之後才驗 PIN」，避免用錯 PIN 探測資料狀態。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ServiceChargeRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS], 429: [PIN_LOCKED]}
+  /api/pos/sessions/{sessionId}:
+    get:
+      tags: [order]
+      operationId: getSessionDetail
+      summary: 用餐詳情
+      description: |
+        用餐紀錄、草稿、所有正式單（含已取消）、小計。小計只算正式單未取消品項，**不含草稿與服務費**。
+        任何狀態的用餐紀錄都可查詢。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 用餐詳情, content: {application/json: {schema: {$ref: '#/components/schemas/SessionDetail'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [SESSION_NOT_FOUND]}
+  /api/pos/sessions/{sessionId}/draft/items:
+    post:
+      tags: [order]
+      operationId: addDraftItem
+      summary: 草稿新增品項
+      description: |
+        每個用餐紀錄最多一張草稿（不存在則建立）。價格以最新菜單為準；草稿不寫歷史、不發事件。
+        前置檢查：用餐紀錄使用中、非結帳中、非待重新結帳。選項驗證依序：數量 1～99 → 同一選項不重複 → 選項屬於品項的群組 → 每群不同選項數在最少與最多之間（不允許重複時數量不大於 1）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemInput'}}}
+      responses:
+        '201': {description: 已新增（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, MENU_ITEM_NOT_SELLABLE]}
+  /api/pos/sessions/{sessionId}/draft/items/{draftItemId}:
+    put:
+      tags: [order]
+      operationId: replaceDraftItem
+      summary: 草稿修改品項（整筆取代）
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: draftItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemInput'}}}
+      responses:
+        '200': {description: 已更新（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, DRAFT_ITEM_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, MENU_ITEM_NOT_SELLABLE]}
+    delete:
+      tags: [order]
+      operationId: deleteDraftItem
+      summary: 草稿刪除品項（實體刪除）
+      description: 草稿變空時保留空草稿。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: draftItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已刪除（回傳整張草稿）, content: {application/json: {schema: {$ref: '#/components/schemas/DraftView'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND, DRAFT_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS]}
+  /api/pos/sessions/{sessionId}/draft/submit:
+    post:
+      tags: [order]
+      operationId: submitDraft
+      summary: 送出草稿（出單）
+      description: |
+        流程：驗證請求編號 → 鎖用餐紀錄 → 冪等重播（同編號回原結果，不論內容）→ 結帳中拒絕 → 空草稿拒絕 → 每項**重新**檢查可售與選項（任一失敗整張失敗）→ 轉正式單 → 寫歷史 → 發佈訂單送出。
+        批次號＝該用餐紀錄最大批次＋1；同時出單只一個成功且批次號不重複。新建立回 201，重播回 200（`replayed` 為 true）。
+        `note` 為訂單備註（0～255 字）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SubmitDraftRequest'}}}
+      responses:
+        '200': {description: 重播（同請求編號）, content: {application/json: {schema: {$ref: '#/components/schemas/SubmitResult'}}}}
+        '201': {description: 已出單, content: {application/json: {schema: {$ref: '#/components/schemas/SubmitResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [SESSION_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, EMPTY_DRAFT, MENU_ITEM_NOT_SELLABLE, CONCURRENT_MODIFICATION]}
+  /api/pos/order-items/{orderItemId}:
+    patch:
+      tags: [order]
+      operationId: modifyOrderItem
+      summary: 修改已送出品項
+      description: |
+        鎖後重新載入；依序拒絕：草稿（`ORDER_NOT_EDITABLE`）→ 結帳中 → 已取消 → 已完成 → 版本不符。
+        製作中的品項修改後保持製作中；以目前菜單重建快照（改價後採用新價格）；寫前後摘要歷史、重算訂單狀態、發佈品項修改（列印修改單）。
+      parameters:
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ModifyOrderItemRequest'}}}
+      responses:
+        '200': {description: 已修改, content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 404: [ORDER_ITEM_NOT_FOUND, MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, ORDER_NOT_EDITABLE, CHECKOUT_IN_PROGRESS, ORDER_ITEM_CANCELLED, ORDER_ITEM_ALREADY_READY, CONCURRENT_MODIFICATION]}
+  /api/pos/order-items/{orderItemId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelOrderItem
+      summary: 取消品項（PIN）
+      description: 「狀態檢查之後才驗 PIN」，避免用錯 PIN 探測資料狀態。已完成不可取消。記理由與操作員工；寫歷史並發佈品項取消（列印取消單）。
+      parameters:
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/OrderItemView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [ORDER_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS, ORDER_NOT_EDITABLE, ORDER_ITEM_CANCELLED, ORDER_ITEM_ALREADY_READY], 429: [PIN_LOCKED]}
+  /api/pos/orders/{orderId}/note:
+    patch:
+      tags: [order]
+      operationId: updateOrderNote
+      summary: 修改訂單備註
+      description: 只寫歷史，不發事件；帶訂單版本。
+      parameters:
+        - {name: orderId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateOrderNoteRequest'}}}
+      responses:
+        '200': {description: 已更新, content: {application/json: {schema: {$ref: '#/components/schemas/OrderView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 404: [ORDER_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, ORDER_NOT_EDITABLE, CHECKOUT_IN_PROGRESS, CONCURRENT_MODIFICATION]}
+  /api/pos/orders/{orderId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelOrder
+      summary: 取消整單（PIN）
+      description: 有任何已完成品項就不可取消；逐項取消並各自寫歷史、發事件。狀態檢查後才驗 PIN。
+      parameters:
+        - {name: orderId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/OrderView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [ORDER_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS, ORDER_NOT_EDITABLE, ORDER_ITEM_ALREADY_READY], 429: [PIN_LOCKED]}
+  /api/pos/sessions/{sessionId}/cancel:
+    post:
+      tags: [order]
+      operationId: cancelSession
+      summary: 取消開桌（PIN）
+      description: 有任何未取消的正式單品項就不可取消；成功後草稿實體刪除、用餐紀錄已取消、桌位回空桌；帳單號不回收。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已取消, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, SESSION_PENDING_RECHECKOUT, CHECKOUT_IN_PROGRESS, SESSION_HAS_SUBMITTED_ORDERS], 429: [PIN_LOCKED]}
+  /api/kds/stations/{station}/items:
+    get:
+      tags: [kds]
+      operationId: listStationItems
+      summary: 站別待處理與製作中品項清單
+      description: |
+        `station` 為 `K1` 或 `K2`；其他值回 404 `NOT_FOUND`。
+        清單規則：站別符合；待處理或製作中；屬於正式單；用餐紀錄為使用中，或**今天營業日已結束**（先付後吃）；已取消不列；依品項編號遞增。
+        一次查詢取回品項、選項、桌號，不在迴圈內逐筆查詢。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+      responses:
+        '200': {description: 清單, content: {application/json: {schema: {$ref: '#/components/schemas/KdsBoard'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [NOT_FOUND]}
+  /api/kds/stations/{station}/items/{orderItemId}/start:
+    post:
+      tags: [kds]
+      operationId: startItem
+      summary: 開始製作（待處理 → 製作中）
+      description: |
+        直接呼叫訂單模組的品項狀態服務。檢查依序：品項存在 → 站別符合 → 用餐紀錄使用中或已結束 → 未取消 → 版本相符 → 轉換合法。
+        廚房狀態變更**不檢查結帳旗標**；用餐紀錄已取消則拒絕。只發事件（推播），不寫列印。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionRequest'}}}
+      responses:
+        '200': {description: 已變更, content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [KDS_STATION_FORBIDDEN], 404: [NOT_FOUND, KDS_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, ORDER_ITEM_CANCELLED, CONCURRENT_MODIFICATION, INVALID_ORDER_ITEM_TRANSITION]}
+  /api/kds/stations/{station}/items/{orderItemId}/complete:
+    post:
+      tags: [kds]
+      operationId: completeItem
+      summary: 完成（待處理或製作中 → 已完成）
+      description: 規則同 `startItem`。
+      parameters:
+        - {name: station, in: path, required: true, schema: {type: string, maxLength: 8}}
+        - {name: orderItemId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionRequest'}}}
+      responses:
+        '200': {description: 已變更, content: {application/json: {schema: {$ref: '#/components/schemas/KdsTransitionResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [KDS_STATION_FORBIDDEN], 404: [NOT_FOUND, KDS_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, ORDER_ITEM_CANCELLED, CONCURRENT_MODIFICATION, INVALID_ORDER_ITEM_TRANSITION]}
+  /ws:
+    get:
+      tags: [kds]
+      operationId: webSocketHandshake
+      summary: WebSocket（STOMP）端點
+      description: |
+        **這不是 REST 操作，僅用來在文件中記載 WebSocket 合約。** 原生 WebSocket（不用 SockJS）。
+
+        **連線**：HTTP 握手放行；裝置憑證放在 **STOMP CONNECT 帧的 `X-Device-Token` 標頭**，不放網址參數。CONNECT 時驗證，憑證缺少或無效 → 回 ERROR 帧並斷線。POS 與 KDS 皆可連線。來源（Origin）只允許公開基底網址。
+        **心跳**：伺服器每 25 秒送一次；**每次心跳重新檢查裝置**，裝置已撤銷則斷線。
+        **主題**（用戶端只訂閱，傳入訊息一律忽略）：`/topic/kds/K1`、`/topic/kds/K2`。
+        **訊息**（JSON，內容見 `KdsMessage`）：`ITEM_UPSERT`（品項新增或更新，完整資料）、`ITEM_REMOVE`（品項移除，只帶編號）、`BOARD_RELOAD`（整板重新載入）。
+        訊息對應事件見 01-PLAN §4.7：訂單送出／品項修改／品項開始製作 → `ITEM_UPSERT`；品項完成／品項取消 → `ITEM_REMOVE`；用餐取消、結束不收費 → 兩站各一則 `BOARD_RELOAD`。
+        推播在交易**提交後**執行，失敗只記日誌；監聽器重新讀取資料，讀不到就改送 `ITEM_REMOVE`。
+
+        **可靠性契約（前端必須遵守）**：至少送一次、不保證順序；以「`orderItemId` ＋ `version`」去重，只套用版本 ≥ 目前版本的更新，**移除一律套用**；斷線重連後整份重新載入（`listStationItems`）；每 60 秒定時對帳；60 秒沒收到任何訊息視為斷線。
+      responses:
+        '101': {description: 切換為 WebSocket}
+  /api/customer/menu:
+    get:
+      tags: [customer]
+      operationId: getCustomerMenu
+      summary: 顧客菜單（無需驗證）
+      description: 只含上架分類中的可售品項；空分類不出現；加價為 0 也回傳。依顯示順序。不含站別、上下架、售完日等內部欄位。
+      security: []
+      responses:
+        '200': {description: 菜單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerMenu'}}}}
+  /api/customer/images/{imageKey}:
+    get:
+      tags: [customer]
+      operationId: getMenuImage
+      summary: 菜單圖片（無需驗證）
+      description: 讀取前先驗證鍵格式（防路徑穿越）；回應帶「禁止猜測內容類型」與可快取標頭。
+      security: []
+      parameters:
+        - {name: imageKey, in: path, required: true, schema: {type: string, maxLength: 128}}
+      responses:
+        '200':
+          description: JPEG 或 PNG
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Cache-Control: {schema: {type: string, example: 'public, max-age=86400'}}
+          content:
+            image/jpeg: {schema: {type: string, format: binary}}
+            image/png: {schema: {type: string, format: binary}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [NOT_FOUND]}
+  /api/customer/sessions/{sessionId}:
+    get:
+      tags: [customer]
+      operationId: verifyCustomerSession
+      summary: 驗證用餐紀錄並取得點餐狀態
+      description: |
+        缺 token 或長度不符、用餐紀錄不存在、token 不符，一律回**完全相同**的 401 `SESSION_TOKEN_INVALID`；驗證本身不檢查狀態與過期。
+        `canOrder`＝使用中、未過期、非結帳中、不是待重新結帳。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 目前狀態, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSession'}}}}
+        '401': {$ref: '#/components/responses/E401'}
+      x-error-codes: {401: [SESSION_TOKEN_INVALID]}
+  /api/customer/sessions/{sessionId}/orders:
+    post:
+      tags: [customer]
+      operationId: submitCustomerOrder
+      summary: 顧客送單
+      description: |
+        流程：token 驗證 → 鎖用餐紀錄並重新比對 token 與狀態 → 冪等（內容雜湊）→ 過期 → 結帳中 → 送單間隔 1 秒 → 單張超過 30 項或正式單已達 50 張（同一步檢查）→ 每項可售與選項驗證 → 建立正式單（來源顧客）→ 寫歷史 → 發佈訂單送出。
+        內容雜湊：每品項為「菜單品項編號,數量,品項備註」，後接 `|` 與依編號排序的「選項編號:數量」（逗號連接）；品項間以 `;` 連接；最後加 `#` 與訂單備註；整串 SHA-256；請求編號不納入。
+        例：`12,2,少辣|5:1,8:1;30,1,|#不要香菜`。
+        新建立回 201；同請求編號且內容相同回 200 與原結果（過期後重送仍取得原結果）；同編號不同內容回 409 `DUPLICATE_REQUEST`。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CustomerOrderRequest'}}}
+      responses:
+        '200': {description: 重播（原結果）, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSubmitResult'}}}}
+        '201': {description: 已送單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerSubmitResult'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '401': {$ref: '#/components/responses/E401'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_QUANTITY, INVALID_MODIFIER_SELECTION, MODIFIER_DUPLICATE_NOT_ALLOWED, MODIFIER_GROUP_SELECTION_OUT_OF_RANGE], 401: [SESSION_TOKEN_INVALID], 404: [MENU_ITEM_NOT_FOUND], 409: [SESSION_NOT_OPEN, DUPLICATE_REQUEST, QR_EXPIRED, CHECKOUT_IN_PROGRESS, SESSION_PENDING_RECHECKOUT, CUSTOMER_ORDER_LIMIT, MENU_ITEM_NOT_SELLABLE, CONCURRENT_MODIFICATION], 429: [CUSTOMER_ORDER_TOO_FAST]}
+    get:
+      tags: [customer]
+      operationId: listCustomerOrders
+      summary: 查看本桌訂單與出餐狀態
+      description: 該用餐紀錄所有正式單（含服務員送的），已取消品項標示 `CANCELLED`。**不含**內部編號、版本、取消原因、價格。過期後仍可查看。
+      security:
+        - SessionToken: []
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 訂單, content: {application/json: {schema: {$ref: '#/components/schemas/CustomerOrders'}}}}
+        '401': {$ref: '#/components/responses/E401'}
+      x-error-codes: {401: [SESSION_TOKEN_INVALID]}
+  /api/pos/payment-methods:
+    get:
+      tags: [checkout]
+      operationId: listPaymentMethods
+      summary: 付款方式清單
+      description: 依排序。本規劃只有現金（`CASH`）；停用的付款方式仍列出（`enabled` 為 false）。
+      responses:
+        '200': {description: 付款方式, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PaymentMethod'}}}}}
+  /api/pos/sessions/{sessionId}/checkout:
+    post:
+      tags: [checkout]
+      operationId: startCheckout
+      summary: 開始結帳
+      description: |
+        流程：鎖用餐紀錄 → 已有結帳中帳單就**直接回傳（200）** → 草稿有品項拒絕 → 沒有可結帳品項拒絕 → 建立帳單（**含未完成品項**）、計算服務費 → 結帳旗標為真（之後訂單、人數、服務費都被鎖住）→ 201。
+        服務費＝小計×費率，HALF_UP 到整數（995 → 100、986 → 99）；折扣欄位保留為 0。待重新結帳的用餐紀錄可正常開始結帳。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已有結帳中帳單（原帳單）, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '201': {description: 已建立帳單, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, UNSENT_ITEMS_EXIST, NOTHING_TO_CHECKOUT, CONCURRENT_MODIFICATION]}
+  /api/pos/checkouts/{checkoutId}/payments:
+    post:
+      tags: [checkout]
+      operationId: pay
+      summary: 付款（可部分付款）
+      description: |
+        流程：冪等（`paymentKey`）在狀態檢查之前 → 帳單必須結帳中 → 付款方式啟用且有處理器 → 實收 > 0 且為整數 → 先建待處理付款 → 伺服器計算未付並呼叫處理器（前端不傳未付）→
+        成功：記入帳與找零；已付 ≥ 總額就完成帳單、結束用餐紀錄、發佈結帳完成（列印收據）。
+        失敗：標記付款失敗，**交易仍提交**，回 409 `PAYMENT_FAILED`（唯一「回錯誤但資料已提交」的地方）。
+        現金入帳最多到未付，超出為找零；不足則付多少入多少，可再付。同時付足額只一筆完成、不超收。
+        同 `paymentKey` ＋同內容回目前帳單（200）；內容不同回 409 `PAYMENT_IDEMPOTENCY_CONFLICT`。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PayRequest'}}}
+      responses:
+        '200': {description: 目前帳單, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {400: [VALIDATION_ERROR, PAYMENT_AMOUNT_INVALID], 404: [CHECKOUT_NOT_FOUND], 409: [PAYMENT_IDEMPOTENCY_CONFLICT, CHECKOUT_NOT_IN_PROGRESS, PAYMENT_METHOD_DISABLED, PAYMENT_FAILED, CONCURRENT_MODIFICATION]}
+  /api/pos/checkouts/{checkoutId}/payments/{paymentId}/refund:
+    post:
+      tags: [checkout]
+      operationId: refundPayment
+      summary: 退回付款（PIN）
+      description: 帳單結帳中、付款成功才可退回。狀態檢查之後驗 PIN 與理由 → 處理器作廢（失敗整筆回滾）→ 付款已退回、扣回已付與找零 → 寫稽核。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+        - {name: paymentId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已退回（回傳帳單）, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [CHECKOUT_NOT_FOUND, NOT_FOUND], 409: [CHECKOUT_NOT_IN_PROGRESS, PAYMENT_NOT_REFUNDABLE, VOID_FAILED], 429: [PIN_LOCKED]}
+  /api/pos/checkouts/{checkoutId}/abandon:
+    post:
+      tags: [checkout]
+      operationId: abandonCheckout
+      summary: 放棄結帳
+      description: 還有成功付款就拒絕（須先退回）；帳單標記已放棄、紀錄全部保留、清除結帳旗標、寫稽核。不需 PIN。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 已放棄, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND], 409: [CHECKOUT_NOT_IN_PROGRESS, CHECKOUT_HAS_PAYMENTS]}
+  /api/pos/checkouts/{checkoutId}/void:
+    post:
+      tags: [checkout]
+      operationId: voidCheckout
+      summary: 作廢帳單（PIN）
+      description: |
+        必須已完成且為**今天營業日**；驗 PIN 與理由 → 每筆成功付款呼叫處理器作廢（任一失敗整筆回滾）→ 帳單與付款已作廢 → 用餐紀錄重開（原桌空著占桌重開；被占或已刪除不占桌重開並標記待重新結帳）→ 發佈結帳作廢。之後依當下設定重新結帳。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已作廢, content: {application/json: {schema: {$ref: '#/components/schemas/Checkout'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [CHECKOUT_NOT_FOUND], 409: [CHECKOUT_NOT_VOIDABLE, CHECKOUT_VOID_NOT_SAME_DAY, VOID_FAILED], 429: [PIN_LOCKED]}
+  /api/pos/sessions/{sessionId}/close-without-payment:
+    post:
+      tags: [checkout]
+      operationId: closeWithoutPayment
+      summary: 結束不收費（PIN）
+      description: 只用於待重新結帳、且沒有結帳中帳單的用餐紀錄；PIN＋理由＋稽核，狀態改為已取消。不是待重新結帳回 409 `SESSION_NOT_OPEN`；有結帳中帳單回 409 `CHECKOUT_IN_PROGRESS`（先完成或放棄結帳）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PinReasonRequest'}}}
+      responses:
+        '200': {description: 已結束, content: {application/json: {schema: {$ref: '#/components/schemas/SessionSummary'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR], 403: [INVALID_PIN], 404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN, CHECKOUT_IN_PROGRESS], 429: [PIN_LOCKED]}
+  /api/pos/checkouts/{checkoutId}/receipt:
+    get:
+      tags: [checkout]
+      operationId: getReceiptPreview
+      summary: 收據預覽
+      description: |
+        任何狀態的帳單都可預覽；未完成時 `payments` 與 `change` 為 null（省略付款區塊）。`text` 為收據純文字（與列印同一個純函式產生；結帳時間以台北時間顯示）。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 收據, content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND]}
+  /api/pos/reports/revenue:
+    get:
+      tags: [report]
+      operationId: getRevenueReport
+      summary: 營業額報表（逐日）
+      description: |
+        起訖皆為營業日且**都算在內**，最多 92 個營業日（相差 91 天可以、92 天不行）；起晚於訖或超過 → `INVALID_DATE_RANGE`。
+        沒資料的日子也回 0；另有合計列。聚合在 DB 完成，報表不改任何資料。
+      parameters:
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+      responses:
+        '200': {description: 報表, content: {application/json: {schema: {$ref: '#/components/schemas/RevenueReport'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_DATE_RANGE]}
+  /api/pos/reports/today:
+    get:
+      tags: [report]
+      operationId: getTodayOverview
+      summary: 今日總覽（即時，不快取）
+      responses:
+        '200': {description: 今日總覽, content: {application/json: {schema: {$ref: '#/components/schemas/TodayOverview'}}}}
+  /api/pos/reports/day-close/preview:
+    get:
+      tags: [report]
+      operationId: previewDayClose
+      summary: 日結預覽（免 PIN）
+      description: |
+        預期現金＝備用金＋當日完成帳單的現金入帳（不含找零，依帳單營業日）；差額＝實點−預期。預覽與存檔用同一函式。不能日結未來。
+      parameters:
+        - {name: date, in: query, required: true, schema: {type: string, format: date}}
+        - {name: reserveFund, in: query, required: true, schema: {type: integer, minimum: 0}}
+        - {name: countedCash, in: query, required: true, schema: {type: integer, minimum: 0}}
+      responses:
+        '200': {description: 日結試算, content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseView'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+      x-error-codes: {400: [VALIDATION_ERROR, DAY_CLOSE_FUTURE_DATE]}
+  /api/pos/reports/day-close:
+    post:
+      tags: [report]
+      operationId: saveDayClose
+      summary: 日結存檔（PIN）
+      description: 先檢查日期（未來日期回 `DAY_CLOSE_FUTURE_DATE`）再驗 PIN；同一天可多筆，最新為準；不鎖資料。這是報表模組唯一的寫入。
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseRequest'}}}
+      responses:
+        '201': {description: 已存檔, content: {application/json: {schema: {$ref: '#/components/schemas/DayCloseRecord'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '403': {$ref: '#/components/responses/E403'}
+        '429': {$ref: '#/components/responses/E429'}
+      x-error-codes: {400: [VALIDATION_ERROR, DAY_CLOSE_FUTURE_DATE], 403: [INVALID_PIN], 429: [PIN_LOCKED]}
+  /api/pos/reports/work-hours:
+    get:
+      tags: [report]
+      operationId: getWorkHoursReport
+      summary: 工時報表
+      description: |
+        依日、週（週一起算）、月分組，可依員工篩選；只計完整班次（含更正後完整的，標示「已更正」）；歸屬上班營業日；已停用員工名稱仍顯示。
+        異常清單列出上班未打卡與下班未打卡的班次（不計工時）。
+      parameters:
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+        - {name: groupBy, in: query, required: false, schema: {type: string, enum: [DAY, WEEK, MONTH], default: DAY}}
+        - {name: employeeId, in: query, required: false, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: 報表, content: {application/json: {schema: {$ref: '#/components/schemas/WorkHoursReport'}}}}
+        '400': {$ref: '#/components/responses/E400'}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {400: [VALIDATION_ERROR, INVALID_DATE_RANGE], 404: [EMPLOYEE_NOT_FOUND]}
+  /api/pos/print/problems:
+    get:
+      tags: [print]
+      operationId: listPrintProblems
+      summary: 列印問題清單
+      description: |
+        列出狀態為失敗、以及等待超過 30 秒仍未列印的工作。**不回傳內容**（內容含 QR 網址的 token），只回類型、目標、狀態、嘗試次數、錯誤摘要、時間。
+      responses:
+        '200': {description: 問題工作, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PrintJobSummary'}}}}}
+  /api/pos/print/jobs/{jobId}/reprint:
+    post:
+      tags: [print]
+      operationId: reprintJob
+      summary: 重印單據
+      description: 建立一筆新工作（原工作保留），內容與原工作完全相同（內容在建立時固定）。
+      parameters:
+        - {name: jobId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [PRINT_JOB_NOT_FOUND]}
+  /api/pos/sessions/{sessionId}/reprint-qr:
+    post:
+      tags: [print]
+      operationId: reprintQr
+      summary: 重印 QR 單
+      description: 不產生新 token；用餐紀錄非使用中則拒絕（規格寫「用餐已結束」，對應 409 `SESSION_NOT_OPEN`）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN]}
+  /api/pos/checkouts/{checkoutId}/reprint-receipt:
+    post:
+      tags: [print]
+      operationId: reprintReceipt
+      summary: 重印收據
+      description: 以收據純函式重新產生內容並建立新工作。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND]}
+components:
+  securitySchemes:
+    DeviceToken: {type: apiKey, in: header, name: X-Device-Token, description: 裝置憑證（配對時只回傳一次）}
+    UnlockToken: {type: apiKey, in: header, name: X-Unlock-Token, description: 管理者解鎖憑證（單一功能有效）}
+    SessionToken: {type: apiKey, in: header, name: X-Session-Token, description: '顧客 Session token（來自 QR 網址片段 #t=，不出現在任何 API 回應）'}
+  responses:
+    E400: {description: 格式或數值不合法, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E401: {description: 裝置憑證或顧客 token 無效, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E403: {description: 權限不足／PIN 錯誤／明確禁止, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E404: {description: 找不到, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E409: {description: 狀態衝突／重複請求／併發衝突, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    E429: {description: 操作太頻繁或已被鎖定, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  schemas:
+    ErrorResponse:
+      type: object
+      description: 錯誤回應只含錯誤碼、固定繁體中文訊息、時間戳，不含堆疊與機密值。
+      required: [code, message, timestamp]
+      properties:
+        code: {$ref: '#/components/schemas/ErrorCode'}
+        message: {type: string}
+        timestamp: {type: string, format: date-time}
+    ErrorCode:
+      type: string
+      description: 01-PLAN §4.8 錯誤碼全集；本表以外不得新增。`TABLE_UNAVAILABLE` 保留、本規劃不使用；`DEVICE_TOKEN_INVALID`、`DEVICE_TYPE_FORBIDDEN`、`INTERNAL_ERROR`、`METHOD_NOT_ALLOWED`、`UNSUPPORTED_MEDIA_TYPE` 為全域或框架層錯誤，不在各操作列出。
+      enum:
+        - VALIDATION_ERROR
+        - NOT_FOUND
+        - METHOD_NOT_ALLOWED
+        - UNSUPPORTED_MEDIA_TYPE
+        - FORBIDDEN
+        - CONCURRENT_MODIFICATION
+        - INTERNAL_ERROR
+        - DUPLICATE_REQUEST
+        - DEVICE_TOKEN_INVALID
+        - DEVICE_TYPE_FORBIDDEN
+        - PAIRING_CODE_INVALID
+        - PAIRING_LOCKED
+        - DEVICE_SELF_REVOKE
+        - INVALID_PIN
+        - PIN_LOCKED
+        - NOT_MANAGER
+        - ALREADY_CLOCKED_IN
+        - CLOCK_TOO_FAST
+        - EMPLOYEE_NOT_FOUND
+        - PIN_ALREADY_USED
+        - LAST_MANAGER
+        - SHIFT_CORRECTION_INVALID
+        - SHIFT_CORRECTION_TOO_OLD
+        - SHIFT_CORRECTION_SELF
+        - MENU_CATEGORY_NOT_FOUND
+        - MENU_CATEGORY_IN_USE
+        - MENU_ITEM_NOT_FOUND
+        - MENU_ITEM_NOT_ARCHIVED
+        - MENU_ITEM_NOT_SELLABLE
+        - MODIFIER_GROUP_NOT_FOUND
+        - MODIFIER_NOT_FOUND
+        - INVALID_PRICE
+        - INVALID_IMAGE
+        - INVALID_SORT_REQUEST
+        - TABLE_NOT_FOUND
+        - TABLE_NO_DUPLICATE
+        - TABLE_OCCUPIED
+        - TABLE_UNAVAILABLE
+        - SESSION_NOT_FOUND
+        - SESSION_NOT_OPEN
+        - SESSION_HAS_SUBMITTED_ORDERS
+        - SESSION_PENDING_RECHECKOUT
+        - QR_EXPIRED
+        - SESSION_TOKEN_INVALID
+        - CUSTOMER_ORDER_LIMIT
+        - CUSTOMER_ORDER_TOO_FAST
+        - INVALID_QUANTITY
+        - ORDER_NOT_FOUND
+        - ORDER_ITEM_NOT_FOUND
+        - ORDER_ITEM_CANCELLED
+        - ORDER_ITEM_ALREADY_READY
+        - INVALID_ORDER_ITEM_TRANSITION
+        - ORDER_NOT_EDITABLE
+        - EMPTY_DRAFT
+        - DRAFT_ITEM_NOT_FOUND
+        - INVALID_MODIFIER_SELECTION
+        - MODIFIER_GROUP_SELECTION_OUT_OF_RANGE
+        - MODIFIER_DUPLICATE_NOT_ALLOWED
+        - CHECKOUT_IN_PROGRESS
+        - UNSENT_ITEMS_EXIST
+        - NOTHING_TO_CHECKOUT
+        - CHECKOUT_NOT_FOUND
+        - CHECKOUT_NOT_IN_PROGRESS
+        - CHECKOUT_NOT_VOIDABLE
+        - CHECKOUT_VOID_NOT_SAME_DAY
+        - CHECKOUT_HAS_PAYMENTS
+        - PAYMENT_METHOD_DISABLED
+        - PAYMENT_AMOUNT_INVALID
+        - PAYMENT_FAILED
+        - PAYMENT_IDEMPOTENCY_CONFLICT
+        - PAYMENT_NOT_REFUNDABLE
+        - VOID_FAILED
+        - KDS_STATION_FORBIDDEN
+        - KDS_ITEM_NOT_FOUND
+        - INVALID_DATE_RANGE
+        - DAY_CLOSE_FUTURE_DATE
+        - PRINT_JOB_NOT_FOUND
+    PageInfo:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: {type: integer, minimum: 0}
+        size: {type: integer, minimum: 1, maximum: 100}
+        totalElements: {type: integer, format: int64}
+        totalPages: {type: integer}
+    Pin:
+      type: string
+      pattern: '^[0-9]{4,6}$'
+      description: 4～6 位數字。機密：不得出現在日誌、回應、測試快照。
+    Reason:
+      type: string
+      minLength: 1
+      maxLength: 255
+    RequestKey:
+      type: string
+      pattern: '^[A-Za-z0-9_-]{1,64}$'
+    Money:
+      type: integer
+      format: int64
+      description: 整數元。
+    BillNo:
+      type: string
+      pattern: '^[0-9]{3,}$'
+      description: 帳單號，三位數補零字串。
+    PinRequest:
+      type: object
+      required: [pin]
+      properties:
+        pin: {$ref: '#/components/schemas/Pin'}
+    PinReasonRequest:
+      type: object
+      required: [pin, reason]
+      properties:
+        pin: {$ref: '#/components/schemas/Pin'}
+        reason: {$ref: '#/components/schemas/Reason'}
+    ReorderRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          items: {type: integer, format: int64}
+          description: 必須剛好等於該層所有未刪除項目；依位置從 0 重新編號。
+    PairRequest:
+      type: object
+      required: [pairingCode]
+      properties:
+        pairingCode: {type: string, pattern: '^[A-Za-z0-9]{8}$', description: 8 位英數字一次性配對碼（機密）}
+    PairResponse:
+      type: object
+      required: [deviceId, name, deviceType, deviceToken]
+      properties:
+        deviceId: {type: integer, format: int64}
+        name: {type: string}
+        deviceType: {$ref: '#/components/schemas/DeviceType'}
+        deviceToken: {type: string, description: 裝置憑證（機密，只回傳這一次）}
+    DeviceType:
+      type: string
+      enum: [POS, KDS]
+    ShiftState:
+      type: string
+      description: 上班未打卡／下班未打卡／上班中／完整班次
+      enum: [MISSING_CLOCK_IN, MISSING_CLOCK_OUT, ON_DUTY, COMPLETE]
+    ClockAction:
+      type: string
+      enum: [CLOCK_IN, CLOCK_OUT]
+    ClockWarning:
+      type: string
+      description: MISSING_CLOCK_IN＝沒上班就下班；MISSING_CLOCK_OUT＝前一營業日忘記下班
+      enum: [MISSING_CLOCK_IN, MISSING_CLOCK_OUT]
+    ShiftBrief:
+      type: object
+      required: [shiftId, businessDate, clockInAt, clockOutAt, minutes, state, corrected]
+      properties:
+        shiftId: {type: integer, format: int64}
+        businessDate: {type: string, format: date, description: 歸屬上班營業日}
+        clockInAt: {type: string, format: date-time, nullable: true}
+        clockOutAt: {type: string, format: date-time, nullable: true}
+        minutes: {type: integer, nullable: true, description: 完整班次才有值；無條件捨去}
+        state: {$ref: '#/components/schemas/ShiftState'}
+        corrected: {type: boolean, description: 已更正標記}
+    ClockResult:
+      type: object
+      description: 打卡與狀態查詢共用。`state` 為該員工目前狀態（上班中或最近一次班次狀態）。
+      required: [employeeId, employeeName, state, nextAction, warnings, todayShifts, todayTotalMinutes]
+      properties:
+        employeeId: {type: integer, format: int64}
+        employeeName: {type: string}
+        state: {$ref: '#/components/schemas/ShiftState'}
+        nextAction: {$ref: '#/components/schemas/ClockAction'}
+        warnings:
+          type: array
+          items: {$ref: '#/components/schemas/ClockWarning'}
+        todayShifts:
+          type: array
+          items: {$ref: '#/components/schemas/ShiftBrief'}
+        todayTotalMinutes: {type: integer}
+    ShiftRecord:
+      allOf:
+        - $ref: '#/components/schemas/ShiftBrief'
+        - type: object
+          required: [employeeId, employeeName]
+          properties:
+            employeeId: {type: integer, format: int64}
+            employeeName: {type: string, description: 已停用員工名稱仍顯示}
+    ClockHistory:
+      type: object
+      required: [days, fromBusinessDate, toBusinessDate, shifts]
+      properties:
+        days: {type: integer}
+        fromBusinessDate: {type: string, format: date}
+        toBusinessDate: {type: string, format: date}
+        shifts:
+          type: array
+          items: {$ref: '#/components/schemas/ShiftRecord'}
+    UnlockFunction:
+      type: string
+      enum: [EMPLOYEE_MANAGE, TABLE_LAYOUT, DEVICE_MANAGE]
+    UnlockRequest:
+      type: object
+      required: [pin, function]
+      properties:
+        pin: {$ref: '#/components/schemas/Pin'}
+        function: {$ref: '#/components/schemas/UnlockFunction'}
+    UnlockResponse:
+      type: object
+      required: [unlockToken, function]
+      properties:
+        unlockToken: {type: string, description: 單一功能憑證（機密）}
+        function: {$ref: '#/components/schemas/UnlockFunction'}
+    EmployeeRole:
+      type: string
+      enum: [STAFF, MANAGER]
+    Employee:
+      type: object
+      required: [id, name, role, active, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        role: {$ref: '#/components/schemas/EmployeeRole'}
+        active: {type: boolean}
+        createdAt: {type: string, format: date-time}
+    EmployeeCreate:
+      type: object
+      required: [name, role, pin]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        role: {$ref: '#/components/schemas/EmployeeRole'}
+        pin: {$ref: '#/components/schemas/Pin'}
+    EmployeeUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        role: {$ref: '#/components/schemas/EmployeeRole'}
+    ShiftCreate:
+      type: object
+      required: [employeeId, clockInAt, clockOutAt, reason]
+      properties:
+        employeeId: {type: integer, format: int64}
+        clockInAt: {type: string, format: date-time}
+        clockOutAt: {type: string, format: date-time}
+        reason: {$ref: '#/components/schemas/Reason'}
+    ShiftUpdate:
+      type: object
+      required: [reason]
+      description: 至少給 clockInAt 或 clockOutAt 其中之一。
+      properties:
+        clockInAt: {type: string, format: date-time}
+        clockOutAt: {type: string, format: date-time}
+        reason: {$ref: '#/components/schemas/Reason'}
+    AuditLogEntry:
+      type: object
+      required: [id, occurredAt, businessDate, action]
+      properties:
+        id: {type: integer, format: int64}
+        occurredAt: {type: string, format: date-time}
+        businessDate: {type: string, format: date}
+        action: {type: string, description: 動作代碼}
+        targetType: {type: string, nullable: true}
+        targetId: {type: string, nullable: true}
+        beforeValue: {type: string, nullable: true, description: 前值（不含任何機密值）}
+        afterValue: {type: string, nullable: true, description: 後值（不含任何機密值）}
+        employeeId: {type: integer, format: int64, nullable: true}
+        deviceId: {type: integer, format: int64, nullable: true}
+        reason: {type: string, nullable: true}
+    AuditLogPage:
+      allOf:
+        - $ref: '#/components/schemas/PageInfo'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items: {$ref: '#/components/schemas/AuditLogEntry'}
+    Device:
+      type: object
+      required: [id, name, deviceType, createdAt, lastUsedAt, revokedAt]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 100}
+        deviceType: {$ref: '#/components/schemas/DeviceType'}
+        createdAt: {type: string, format: date-time}
+        lastUsedAt: {type: string, format: date-time, nullable: true, description: 以分鐘為單位更新}
+        revokedAt: {type: string, format: date-time, nullable: true}
+        paired: {type: boolean, description: 是否已完成配對（有憑證）}
+    DeviceCreate:
+      type: object
+      required: [name, deviceType]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        deviceType: {$ref: '#/components/schemas/DeviceType'}
+    DevicePairing:
+      type: object
+      required: [device, pairingCode, pairingExpiresAt]
+      properties:
+        device: {$ref: '#/components/schemas/Device'}
+        pairingCode: {type: string, description: 8 位英數字一次性配對碼（機密，只回傳這一次）}
+        pairingExpiresAt: {type: string, format: date-time}
+    Station:
+      type: string
+      description: 站別只有 K1、K2（D-11）。
+      enum: [K1, K2]
+    MenuTree:
+      type: object
+      required: [categories]
+      properties:
+        categories:
+          type: array
+          items: {$ref: '#/components/schemas/MenuCategory'}
+    MenuCategory:
+      type: object
+      required: [id, name, displayOrder, active, items]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999}
+        active: {type: boolean}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/MenuItem'}
+    MenuItem:
+      type: object
+      required: [id, categoryId, name, price, station, active, soldOut, sellable, displayOrder, modifierGroups]
+      properties:
+        id: {type: integer, format: int64}
+        categoryId: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean}
+        soldOutBusinessDate: {type: string, format: date, nullable: true, description: 售完營業日；重新上架不清除}
+        soldOut: {type: boolean, description: 售完營業日等於今天營業日}
+        sellable: {type: boolean, description: 查詢時計算（四個條件）}
+        imageKey: {type: string, nullable: true}
+        displayOrder: {type: integer}
+        modifierGroups:
+          type: array
+          items: {$ref: '#/components/schemas/ModifierGroup'}
+    ModifierGroup:
+      type: object
+      required: [id, name, minSelect, maxSelect, allowDuplicate, displayOrder, modifiers]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean, description: 是否允許同一選項重複（數量 >1）}
+        displayOrder: {type: integer}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/Modifier'}
+    Modifier:
+      type: object
+      required: [id, name, priceDelta, displayOrder]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {$ref: '#/components/schemas/Money'}
+        displayOrder: {type: integer}
+    CategoryCreate:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999, description: 省略則排在最後}
+        active: {type: boolean, default: true}
+    CategoryUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        displayOrder: {type: integer, minimum: 0, maximum: 9999}
+        active: {type: boolean}
+    ItemCreate:
+      type: object
+      required: [categoryId, name, price, station]
+      properties:
+        categoryId: {type: integer, format: int64}
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {type: number, minimum: 0, maximum: 9999999, description: 必須為整數；有小數回 INVALID_PRICE（所以請求型別為 number）}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean, default: false}
+    ItemUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 80}
+        price: {type: number, minimum: 0, maximum: 9999999, description: 同 ItemCreate.price}
+        station: {$ref: '#/components/schemas/Station'}
+        active: {type: boolean}
+    ModifierGroupCreate:
+      type: object
+      required: [name, minSelect, maxSelect]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean, default: false}
+    ModifierGroupUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        minSelect: {type: integer, minimum: 0, maximum: 20}
+        maxSelect: {type: integer, minimum: 1, maximum: 20}
+        allowDuplicate: {type: boolean}
+    ModifierCreate:
+      type: object
+      required: [name, priceDelta]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {type: number, minimum: 0, maximum: 9999999, description: 必須為整數，0 允許；有小數回 INVALID_PRICE}
+    ModifierUpdate:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 50}
+        priceDelta: {type: number, minimum: 0, maximum: 9999999}
+    TableShape:
+      type: string
+      enum: [SQUARE, ROUND, RECTANGLE]
+    TableLayout:
+      type: object
+      required: [id, tableNo, capacity, shape, width, height, x, y, area]
+      properties:
+        id: {type: integer, format: int64}
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32, description: 區域；空字串表示無}
+    TableView:
+      allOf:
+        - $ref: '#/components/schemas/TableLayout'
+        - type: object
+          required: [inUse]
+          properties:
+            inUse: {type: boolean, description: 是否有占桌的使用中用餐紀錄}
+            session:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/SessionSummary'
+    TableCreate:
+      type: object
+      required: [tableNo, capacity, shape, width, height, x, y]
+      properties:
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32, default: ''}
+    TableUpdate:
+      type: object
+      properties:
+        tableNo: {type: string, minLength: 1, maxLength: 20}
+        capacity: {type: integer, minimum: 1, maximum: 50}
+        shape: {$ref: '#/components/schemas/TableShape'}
+        width: {type: integer, minimum: 40, maximum: 400}
+        height: {type: integer, minimum: 40, maximum: 400}
+        x: {type: integer, minimum: 0, maximum: 5000}
+        y: {type: integer, minimum: 0, maximum: 5000}
+        area: {type: string, maxLength: 32}
+    SessionStatus:
+      type: string
+      description: 使用中／已結束／已取消
+      enum: [OPEN, CLOSED, CANCELLED]
+    SessionSummary:
+      type: object
+      description: 用餐紀錄摘要。**不含顧客 token**。
+      required: [id, tableId, tableNo, billNo, businessDate, status, occupiesTable, guestCount, openedAt, qrExpiresAt, qrExpired, serviceChargeEnabled, checkoutInProgress, pendingRecheckout]
+      properties:
+        id: {type: integer, format: int64}
+        tableId: {type: integer, format: int64}
+        tableNo: {type: string}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        businessDate: {type: string, format: date}
+        status: {$ref: '#/components/schemas/SessionStatus'}
+        occupiesTable: {type: boolean, description: 使用中但不占桌（不占桌重開）時為 false}
+        guestCount: {type: integer, minimum: 1, maximum: 99}
+        openedAt: {type: string, format: date-time}
+        qrExpiresAt: {type: string, format: date-time}
+        qrExpired: {type: boolean, description: 查詢時判斷}
+        serviceChargeEnabled: {type: boolean}
+        checkoutInProgress: {type: boolean}
+        pendingRecheckout: {type: boolean}
+    OpenTableRequest:
+      type: object
+      required: [guestCount]
+      properties:
+        guestCount: {type: integer, minimum: 1, maximum: 99}
+    ServiceChargeRequest:
+      type: object
+      required: [enabled, pin]
+      properties:
+        enabled: {type: boolean}
+        pin: {$ref: '#/components/schemas/Pin'}
+    ItemStatus:
+      type: string
+      description: 待處理／製作中／已完成／已取消。已完成與已取消是終點。
+      enum: [PENDING, IN_PROGRESS, DONE, CANCELLED]
+    OrderStatus:
+      type: string
+      description: 已送出／製作中／部分上餐／已全部上餐／已取消（只看未取消品項重算）
+      enum: [SUBMITTED, IN_PROGRESS, PARTIALLY_SERVED, SERVED, CANCELLED]
+    OrderSource:
+      type: string
+      enum: [STAFF, CUSTOMER]
+    SelectedModifier:
+      type: object
+      required: [modifierId, quantity]
+      properties:
+        modifierId: {type: integer, format: int64}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+    OrderItemInput:
+      type: object
+      required: [menuItemId, quantity]
+      properties:
+        menuItemId: {type: integer, format: int64}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/SelectedModifier'}
+        note: {type: string, maxLength: 255, default: ''}
+    ItemModifierView:
+      type: object
+      required: [modifierId, name, priceDelta, quantity]
+      properties:
+        modifierId: {type: integer, format: int64}
+        name: {type: string}
+        priceDelta: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+    DraftItemView:
+      type: object
+      required: [id, menuItemId, name, basePrice, unitPrice, quantity, lineTotal, station, modifiers, note]
+      properties:
+        id: {type: integer, format: int64}
+        menuItemId: {type: integer, format: int64}
+        name: {type: string}
+        basePrice: {$ref: '#/components/schemas/Money'}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+        note: {type: string}
+    DraftView:
+      type: object
+      required: [orderId, items]
+      properties:
+        orderId: {type: integer, format: int64}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/DraftItemView'}
+    OrderItemView:
+      type: object
+      description: 單價＝基本價＋Σ（加價×數量）；小計＝單價×數量。名稱、價格、站別、選項為建立時的快照。
+      required: [id, orderId, menuItemId, name, basePrice, unitPrice, quantity, lineTotal, station, modifiers, note, status, version]
+      properties:
+        id: {type: integer, format: int64}
+        orderId: {type: integer, format: int64}
+        menuItemId: {type: integer, format: int64}
+        name: {type: string}
+        basePrice: {$ref: '#/components/schemas/Money'}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        quantity: {type: integer}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        station: {$ref: '#/components/schemas/Station'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+        note: {type: string}
+        status: {$ref: '#/components/schemas/ItemStatus'}
+        version: {type: integer, description: 狀態／數量／選項／備註變更時 +1}
+        cancelReason: {type: string, nullable: true}
+        cancelledAt: {type: string, format: date-time, nullable: true}
+    OrderView:
+      type: object
+      required: [id, batchNo, status, source, note, version, submittedAt, items]
+      properties:
+        id: {type: integer, format: int64}
+        batchNo: {type: integer, description: 該用餐紀錄內的批次號}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        source: {$ref: '#/components/schemas/OrderSource'}
+        note: {type: string}
+        version: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/OrderItemView'}
+    SessionDetail:
+      type: object
+      required: [session, draft, orders, subtotal]
+      properties:
+        session: {$ref: '#/components/schemas/SessionSummary'}
+        draft:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DraftView'
+        orders:
+          type: array
+          items: {$ref: '#/components/schemas/OrderView'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+    SubmitDraftRequest:
+      type: object
+      required: [requestId]
+      properties:
+        requestId: {$ref: '#/components/schemas/RequestKey'}
+        note: {type: string, maxLength: 255, default: ''}
+    SubmitResult:
+      type: object
+      required: [orderId, batchNo, itemCount, replayed]
+      properties:
+        orderId: {type: integer, format: int64}
+        batchNo: {type: integer}
+        itemCount: {type: integer}
+        replayed: {type: boolean}
+    ModifyOrderItemRequest:
+      type: object
+      required: [expectedVersion, quantity]
+      properties:
+        expectedVersion: {type: integer, description: 與目前版本不符回 CONCURRENT_MODIFICATION}
+        quantity: {type: integer, minimum: 1, maximum: 99}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/SelectedModifier'}
+        note: {type: string, maxLength: 255, default: ''}
+    UpdateOrderNoteRequest:
+      type: object
+      required: [expectedVersion, note]
+      properties:
+        expectedVersion: {type: integer}
+        note: {type: string, maxLength: 255}
+    KdsModifier:
+      type: object
+      required: [name, quantity]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+    KdsItem:
+      type: object
+      required: [orderItemId, orderId, sessionId, tableNo, batchNo, name, quantity, note, modifiers, status, version, submittedAt, orderNote]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        orderId: {type: integer, format: int64}
+        sessionId: {type: integer, format: int64}
+        tableNo: {type: string}
+        batchNo: {type: integer}
+        name: {type: string}
+        quantity: {type: integer}
+        note: {type: string}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/KdsModifier'}
+        status:
+          type: string
+          enum: [PENDING, IN_PROGRESS]
+        version: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        orderNote: {type: string}
+    KdsBoard:
+      type: object
+      required: [station, items, generatedAt]
+      properties:
+        station: {$ref: '#/components/schemas/Station'}
+        generatedAt: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/KdsItem'}
+    KdsTransitionRequest:
+      type: object
+      required: [expectedVersion]
+      properties:
+        expectedVersion: {type: integer, description: 與目前版本不符回 CONCURRENT_MODIFICATION}
+    KdsTransitionResult:
+      type: object
+      required: [orderItemId, status, version]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        status: {$ref: '#/components/schemas/ItemStatus'}
+        version: {type: integer}
+    KdsMessage:
+      description: 推播訊息；以 `type` 區分。
+      oneOf:
+        - $ref: '#/components/schemas/KdsItemUpsert'
+        - $ref: '#/components/schemas/KdsItemRemove'
+        - $ref: '#/components/schemas/KdsBoardReload'
+      discriminator:
+        propertyName: type
+        mapping:
+          ITEM_UPSERT: '#/components/schemas/KdsItemUpsert'
+          ITEM_REMOVE: '#/components/schemas/KdsItemRemove'
+          BOARD_RELOAD: '#/components/schemas/KdsBoardReload'
+    KdsItemUpsert:
+      type: object
+      required: [type, item]
+      properties:
+        type: {type: string, enum: [ITEM_UPSERT]}
+        item: {$ref: '#/components/schemas/KdsItem'}
+    KdsItemRemove:
+      type: object
+      required: [type, orderItemId]
+      properties:
+        type: {type: string, enum: [ITEM_REMOVE]}
+        orderItemId: {type: integer, format: int64}
+    KdsBoardReload:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [BOARD_RELOAD]}
+    CustomerMenu:
+      type: object
+      required: [categories]
+      properties:
+        categories:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerCategory'}
+    CustomerCategory:
+      type: object
+      required: [id, name, items]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerMenuItem'}
+    CustomerMenuItem:
+      type: object
+      required: [id, name, price, modifierGroups]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        price: {$ref: '#/components/schemas/Money'}
+        imageKey: {type: string, nullable: true}
+        modifierGroups:
+          type: array
+          items: {$ref: '#/components/schemas/ModifierGroup'}
+    CustomerSession:
+      type: object
+      required: [sessionId, status, tableNo, qrExpiresAt, expired, canOrder, serviceChargeEnabled]
+      properties:
+        sessionId: {type: integer, format: int64}
+        status: {$ref: '#/components/schemas/SessionStatus'}
+        tableNo: {type: string}
+        qrExpiresAt: {type: string, format: date-time}
+        expired: {type: boolean}
+        canOrder: {type: boolean}
+        serviceChargeEnabled: {type: boolean}
+    CustomerOrderRequest:
+      type: object
+      required: [requestId, items]
+      properties:
+        requestId: {$ref: '#/components/schemas/RequestKey'}
+        items:
+          type: array
+          minItems: 1
+          description: 單張最多 30 項（超過回 CUSTOMER_ORDER_LIMIT，與正式單 50 張上限同一步檢查），所以此處不設 maxItems。
+          items: {$ref: '#/components/schemas/OrderItemInput'}
+        note: {type: string, maxLength: 255, default: ''}
+    CustomerSubmitResult:
+      type: object
+      required: [batchNo, itemCount, replayed]
+      properties:
+        batchNo: {type: integer}
+        itemCount: {type: integer}
+        replayed: {type: boolean}
+    CustomerOrders:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerOrder'}
+    CustomerOrder:
+      type: object
+      required: [batchNo, submittedAt, note, items]
+      properties:
+        batchNo: {type: integer}
+        submittedAt: {type: string, format: date-time}
+        note: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/CustomerOrderItem'}
+    CustomerOrderItem:
+      type: object
+      required: [name, quantity, modifiers, note, status]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/KdsModifier'}
+        note: {type: string}
+        status: {$ref: '#/components/schemas/ItemStatus'}
+    CheckoutStatus:
+      type: string
+      description: 結帳中／已完成／已作廢／已放棄（前兩者佔「有效帳單」位置）
+      enum: [IN_PROGRESS, COMPLETED, VOIDED, ABANDONED]
+    PaymentStatus:
+      type: string
+      description: 待處理／成功／失敗／已作廢／已退回
+      enum: [PENDING, SUCCESS, FAILED, VOIDED, REFUNDED]
+    PaymentMethod:
+      type: object
+      required: [code, name, enabled, displayOrder]
+      properties:
+        code: {type: string, example: CASH}
+        name: {type: string}
+        enabled: {type: boolean}
+        displayOrder: {type: integer}
+    CheckoutLine:
+      type: object
+      required: [orderItemId, name, quantity, unitPrice, lineTotal, itemStatus, modifiers]
+      properties:
+        orderItemId: {type: integer, format: int64}
+        name: {type: string}
+        quantity: {type: integer}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        itemStatus: {$ref: '#/components/schemas/ItemStatus'}
+        modifiers:
+          type: array
+          items: {$ref: '#/components/schemas/ItemModifierView'}
+    CheckoutCharge:
+      type: object
+      required: [name, rate, amount]
+      properties:
+        name: {type: string, example: 服務費}
+        rate: {type: number, example: 0.1}
+        amount: {$ref: '#/components/schemas/Money'}
+    Payment:
+      type: object
+      required: [id, paymentKey, methodCode, receivedAmount, appliedAmount, changeAmount, status, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        paymentKey: {$ref: '#/components/schemas/RequestKey'}
+        methodCode: {type: string}
+        receivedAmount: {$ref: '#/components/schemas/Money'}
+        appliedAmount: {$ref: '#/components/schemas/Money'}
+        changeAmount: {$ref: '#/components/schemas/Money'}
+        status: {$ref: '#/components/schemas/PaymentStatus'}
+        createdAt: {type: string, format: date-time}
+    Checkout:
+      type: object
+      description: 已付、找零、未付由成功付款計算。
+      required: [id, sessionId, billNo, status, lines, subtotal, charges, discount, total, paid, change, unpaid, quickAmounts, payments, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        sessionId: {type: integer, format: int64}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        status: {$ref: '#/components/schemas/CheckoutStatus'}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutLine'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        charges:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutCharge'}
+        discount: {$ref: '#/components/schemas/Money'}
+        total: {$ref: '#/components/schemas/Money'}
+        paid: {$ref: '#/components/schemas/Money'}
+        change: {$ref: '#/components/schemas/Money'}
+        unpaid: {$ref: '#/components/schemas/Money'}
+        quickAmounts:
+          type: array
+          description: '{未付、向上取整到 100、500、1000} 去重排序（1096 → 1096、1100、1500、2000）；已付清為空列表'
+          items: {$ref: '#/components/schemas/Money'}
+        payments:
+          type: array
+          items: {$ref: '#/components/schemas/Payment'}
+        createdAt: {type: string, format: date-time}
+        completedAt: {type: string, format: date-time, nullable: true}
+    PayRequest:
+      type: object
+      required: [paymentKey, methodCode, receivedAmount]
+      properties:
+        paymentKey: {$ref: '#/components/schemas/RequestKey'}
+        methodCode: {type: string, maxLength: 32}
+        receivedAmount: {type: number, exclusiveMinimum: true, minimum: 0, description: 實收；必須為正整數，有小數回 PAYMENT_AMOUNT_INVALID（所以請求型別為 number）}
+    ReceiptLine:
+      type: object
+      required: [name, quantity, unitPrice, lineTotal, modifiers]
+      properties:
+        name: {type: string}
+        quantity: {type: integer}
+        unitPrice: {$ref: '#/components/schemas/Money'}
+        lineTotal: {$ref: '#/components/schemas/Money'}
+        modifiers:
+          type: array
+          items: {type: string}
+    ReceiptPayment:
+      type: object
+      required: [methodName, receivedAmount, appliedAmount]
+      properties:
+        methodName: {type: string}
+        receivedAmount: {$ref: '#/components/schemas/Money'}
+        appliedAmount: {$ref: '#/components/schemas/Money'}
+    Receipt:
+      type: object
+      required: [storeName, tableNo, billNo, status, lines, subtotal, charges, total, text]
+      properties:
+        storeName: {type: string, description: 未設定則為「餐廳」}
+        tableNo: {type: string}
+        billNo: {$ref: '#/components/schemas/BillNo'}
+        status: {$ref: '#/components/schemas/CheckoutStatus'}
+        completedAt: {type: string, format: date-time, nullable: true}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/ReceiptLine'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        charges:
+          type: array
+          items: {$ref: '#/components/schemas/CheckoutCharge'}
+        total: {$ref: '#/components/schemas/Money'}
+        payments:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ReceiptPayment'}
+        change: {type: integer, format: int64, nullable: true, description: 未完成時為 null}
+        text: {type: string, description: 收據純文字}
+    RevenueRow:
+      type: object
+      required: [tableCount, guestCount, revenue, subtotal, serviceCharge, voidCount, abandonCount, refundCount, cancelledItemCount]
+      properties:
+        tableCount: {type: integer, description: 桌數}
+        guestCount: {type: integer, description: 人數}
+        revenue: {$ref: '#/components/schemas/Money'}
+        subtotal: {$ref: '#/components/schemas/Money'}
+        serviceCharge: {$ref: '#/components/schemas/Money'}
+        voidCount: {type: integer, description: 作廢數}
+        abandonCount: {type: integer, description: 放棄數}
+        refundCount: {type: integer, description: 退回付款數}
+        cancelledItemCount: {type: integer, description: 取消品項數}
+    RevenueDay:
+      allOf:
+        - $ref: '#/components/schemas/RevenueRow'
+        - type: object
+          required: [businessDate]
+          properties:
+            businessDate: {type: string, format: date}
+    RevenueReport:
+      type: object
+      required: [from, to, days, total]
+      properties:
+        from: {type: string, format: date}
+        to: {type: string, format: date}
+        days:
+          type: array
+          items: {$ref: '#/components/schemas/RevenueDay'}
+        total: {$ref: '#/components/schemas/RevenueRow'}
+    TodayOverview:
+      type: object
+      required: [businessDate, revenue, openTableCount, onDutyCount]
+      properties:
+        businessDate: {type: string, format: date}
+        revenue: {$ref: '#/components/schemas/Money'}
+        openTableCount: {type: integer, description: 使用中桌數}
+        onDutyCount: {type: integer, description: 上班中人數}
+    DayCloseRequest:
+      type: object
+      required: [date, reserveFund, countedCash, pin]
+      properties:
+        date: {type: string, format: date}
+        reserveFund: {type: integer, minimum: 0}
+        countedCash: {type: integer, minimum: 0}
+        pin: {$ref: '#/components/schemas/Pin'}
+    DayCloseView:
+      type: object
+      required: [businessDate, reserveFund, cashReceived, expectedCash, countedCash, difference]
+      properties:
+        businessDate: {type: string, format: date}
+        reserveFund: {$ref: '#/components/schemas/Money'}
+        cashReceived: {$ref: '#/components/schemas/Money'}
+        expectedCash: {$ref: '#/components/schemas/Money'}
+        countedCash: {$ref: '#/components/schemas/Money'}
+        difference: {type: integer, format: int64, description: 實點−預期（可為負）}
+    DayCloseRecord:
+      allOf:
+        - $ref: '#/components/schemas/DayCloseView'
+        - type: object
+          required: [id, closedAt, employeeId, employeeName]
+          properties:
+            id: {type: integer, format: int64}
+            closedAt: {type: string, format: date-time}
+            employeeId: {type: integer, format: int64}
+            employeeName: {type: string}
+    WorkHoursRow:
+      type: object
+      required: [employeeId, employeeName, minutes, shiftCount, includesCorrected]
+      properties:
+        employeeId: {type: integer, format: int64}
+        employeeName: {type: string}
+        minutes: {type: integer}
+        shiftCount: {type: integer}
+        includesCorrected: {type: boolean, description: 該期間內含已更正班次}
+    WorkHoursGroup:
+      type: object
+      required: [periodStart, periodEnd, rows]
+      properties:
+        periodStart: {type: string, format: date}
+        periodEnd: {type: string, format: date}
+        rows:
+          type: array
+          items: {$ref: '#/components/schemas/WorkHoursRow'}
+    WorkHoursReport:
+      type: object
+      required: [groupBy, groups, anomalies]
+      properties:
+        groupBy: {type: string, enum: [DAY, WEEK, MONTH]}
+        groups:
+          type: array
+          items: {$ref: '#/components/schemas/WorkHoursGroup'}
+        anomalies:
+          type: array
+          items: {$ref: '#/components/schemas/ShiftRecord'}
+    PrintJobType:
+      type: string
+      description: QR 單／廚房單／修改單／取消單／收據
+      enum: [QR, KITCHEN, MODIFY, CANCEL, RECEIPT]
+    PrintJobStatus:
+      type: string
+      description: 待列印／已列印／失敗
+      enum: [PENDING, PRINTED, FAILED]
+    PrintJobSource:
+      type: string
+      description: 業務事件／手動重印
+      enum: [EVENT, REPRINT]
+    PrintJobSummary:
+      type: object
+      description: 不含內容。`lastError` 為錯誤摘要，不得含機密值。
+      required: [id, type, target, status, attempts, source, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        type: {$ref: '#/components/schemas/PrintJobType'}
+        target: {type: string, description: 站別（K1、K2）或收據印表機（RECEIPT）}
+        status: {$ref: '#/components/schemas/PrintJobStatus'}
+        attempts: {type: integer, description: 嘗試次數；上限 5 次}
+        nextAttemptAt: {type: string, format: date-time, nullable: true}
+        lastError: {type: string, nullable: true}
+        source: {$ref: '#/components/schemas/PrintJobSource'}
+        relatedId: {type: integer, format: int64, nullable: true, description: 相關編號（用餐紀錄、訂單或帳單）}
+        createdAt: {type: string, format: date-time}
+        printedAt: {type: string, format: date-time, nullable: true}

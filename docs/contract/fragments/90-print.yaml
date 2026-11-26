@@ -1,0 +1,76 @@
+# @paths
+  /api/pos/print/problems:
+    get:
+      tags: [print]
+      operationId: listPrintProblems
+      summary: 列印問題清單
+      description: |
+        列出狀態為失敗、以及等待超過 30 秒仍未列印的工作。**不回傳內容**（內容含 QR 網址的 token），只回類型、目標、狀態、嘗試次數、錯誤摘要、時間。
+      responses:
+        '200': {description: 問題工作, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PrintJobSummary'}}}}}
+  /api/pos/print/jobs/{jobId}/reprint:
+    post:
+      tags: [print]
+      operationId: reprintJob
+      summary: 重印單據
+      description: 建立一筆新工作（原工作保留），內容與原工作完全相同（內容在建立時固定）。
+      parameters:
+        - {name: jobId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [PRINT_JOB_NOT_FOUND]}
+  /api/pos/sessions/{sessionId}/reprint-qr:
+    post:
+      tags: [print]
+      operationId: reprintQr
+      summary: 重印 QR 單
+      description: 不產生新 token；用餐紀錄非使用中則拒絕（規格寫「用餐已結束」，對應 409 `SESSION_NOT_OPEN`）。
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+        '409': {$ref: '#/components/responses/E409'}
+      x-error-codes: {404: [SESSION_NOT_FOUND], 409: [SESSION_NOT_OPEN]}
+  /api/pos/checkouts/{checkoutId}/reprint-receipt:
+    post:
+      tags: [print]
+      operationId: reprintReceipt
+      summary: 重印收據
+      description: 以收據純函式重新產生內容並建立新工作。
+      parameters:
+        - {name: checkoutId, in: path, required: true, schema: {type: integer, format: int64}}
+      responses:
+        '201': {description: 已建立新工作, content: {application/json: {schema: {$ref: '#/components/schemas/PrintJobSummary'}}}}
+        '404': {$ref: '#/components/responses/E404'}
+      x-error-codes: {404: [CHECKOUT_NOT_FOUND]}
+# @schemas
+    PrintJobType:
+      type: string
+      description: QR 單／廚房單／修改單／取消單／收據
+      enum: [QR, KITCHEN, MODIFY, CANCEL, RECEIPT]
+    PrintJobStatus:
+      type: string
+      description: 待列印／已列印／失敗
+      enum: [PENDING, PRINTED, FAILED]
+    PrintJobSource:
+      type: string
+      description: 業務事件／手動重印
+      enum: [EVENT, REPRINT]
+    PrintJobSummary:
+      type: object
+      description: 不含內容。`lastError` 為錯誤摘要，不得含機密值。
+      required: [id, type, target, status, attempts, source, createdAt]
+      properties:
+        id: {type: integer, format: int64}
+        type: {$ref: '#/components/schemas/PrintJobType'}
+        target: {type: string, description: 站別（K1、K2）或收據印表機（RECEIPT）}
+        status: {$ref: '#/components/schemas/PrintJobStatus'}
+        attempts: {type: integer, description: 嘗試次數；上限 5 次}
+        nextAttemptAt: {type: string, format: date-time, nullable: true}
+        lastError: {type: string, nullable: true}
+        source: {$ref: '#/components/schemas/PrintJobSource'}
+        relatedId: {type: integer, format: int64, nullable: true, description: 相關編號（用餐紀錄、訂單或帳單）}
+        createdAt: {type: string, format: date-time}
+        printedAt: {type: string, format: date-time, nullable: true}
