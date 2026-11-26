@@ -136,7 +136,7 @@ public abstract class AbstractIntegrationTest {
         jdbc.execute("SET FOREIGN_KEY_CHECKS = 0");
         for (String table : tables) {
             if (!KEEP_TABLES.contains(table.toLowerCase())) {
-                jdbc.execute("TRUNCATE TABLE `" + table + "`");
+                jdbc.execute("DELETE FROM `" + table + "`"); // 表都很小，DELETE 比 TRUNCATE 快得多
             }
         }
         jdbc.execute("SET FOREIGN_KEY_CHECKS = 1");

@@ -30,6 +30,9 @@ spring:
       max-request-size: 10MB
   jackson:
     default-property-inclusion: always
+    deserialization:
+      # 整數欄位收到小數（例如人數 2.5）要拒絕，不可悄悄截斷
+      accept-float-as-int: false
 
 server:
   address: 127.0.0.1

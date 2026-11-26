@@ -6,11 +6,11 @@
 ## 目前狀態
 
 - 規格：**規格說明書 v1（2026-11-26）**，四份文件 01-PLAN／02-TODO／03-BOUNDARIES／04-LOG。
-- 實作：**S0、S1、S2、S3 完成。37/107 張卡。全部測試 346/346。**
+- 實作：**S0～S4 完成。42/107 張卡。全部測試 418/418。**
 - 待決：無。
   - 已結案：#1（HTTP 狀態對照）、#2（列印重試等待）、#3（建置工具）、#4（套件根名稱 `restaurant_pos`）。
 - 開工前（使用者）：git commit 留起點 → 四份文件放進 `docs/plan/`、舊文件移 `docs/archive/` → 建立 `CLAUDE.md` → 確認 Docker 可執行、JDK 17 可用。
-- 下一張卡：**4.1**（S4 桌位與用餐紀錄）。
+- 下一張卡：**5.1**（S5 訂單）。
 
 ---
 
@@ -28,6 +28,20 @@
 
 ---
 
+## 2026-11-26　S4 桌位與用餐紀錄 完成（卡 4.1～4.5，S4 驗收通過）
+- 做了：桌位 CRUD 與桌號自然排序、開桌（帳單號流水、token、QR 到期）、QR 圖片（ZXing）、修改人數與服務費（PIN＋稽核）、生命週期方法（結束、取消、兩種重開）與待重新結帳清單、S4 驗收。全部測試 418／418 通過。
+- 動到的程式碼：新增 table 模組（DiningTable、DailySequence、TableSession、Repository、TableLayoutService、TableSessionService、QrImageService、DailySequenceService、兩個 Controller、SessionView、兩個事件）；遷移 V6；pom 新增 zxing core、javase 3.5.3（規格 §3 明列）。
+- 決定（規格沒寫、AI 草擬）：
+  - 「目前占用桌位唯一」以 occupying_table_id（只在使用中且占桌時有值）的唯一索引實現；token 存明碼（重印 QR 需要），但任何 API 回應與 toString 都不含。
+  - 帳單號流水列在獨立交易中先確保存在，避免每個營業日第一次同時開不同桌時其中一邊失敗；欄位名 last_no（last_value 是 MySQL 保留字）。
+  - 給其他模組的生命週期方法（lockById、lockEditable、close、cancel、reopen、setCheckoutInProgress）一律要求既有交易（MANDATORY），回傳 SessionView（不含 token）。
+  - 修改人數與服務費的檢查順序：使用中 → 待重新結帳 → 結帳中；服務費先檢查狀態、之後才驗 PIN；值沒變不寫稽核。
+  - 整數欄位收到小數（如人數 2.5）一律拒絕（spring.jackson.deserialization.accept-float-as-int=false）。
+  - 桌號唯一只做程式檢查（規格明訂），不加資料庫唯一索引。
+  - 測試基底清表改用 DELETE（比 TRUNCATE 快）。
+- 待決：無。
+- 測試：全部 418／418。
+- 下一步：S5 訂單。
 ## 2026-11-26　S3 菜單 完成（卡 3.1～3.8，S3 驗收通過）
 - 做了：分類、品項、選項群組與選項（含稽核）、售完與恢復、可售判斷與給訂單的快照、排序、圖片上傳／刪除／取圖、顧客菜單與 S3 驗收。全部測試 346／346 通過。
 - 動到的程式碼：新增 menu 模組（實體、Repository、MenuQueryService、MenuCategoryService、MenuItemService、ModifierService、MenuController、CustomerMenuController）、shared.model.Station；遷移 V5（station 種子 K1、K2，menu_category、menu_item、modifier_group、modifier）。
