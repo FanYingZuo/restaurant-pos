@@ -6,11 +6,11 @@
 ## 目前狀態
 
 - 規格：**規格說明書 v1（2026-11-26）**，四份文件 01-PLAN／02-TODO／03-BOUNDARIES／04-LOG。
-- 實作：**S0、S1、S2 完成。29/107 張卡。全部測試 282/282。**
+- 實作：**S0、S1、S2、S3 完成。37/107 張卡。全部測試 346/346。**
 - 待決：無。
   - 已結案：#1（HTTP 狀態對照）、#2（列印重試等待）、#3（建置工具）、#4（套件根名稱 `restaurant_pos`）。
 - 開工前（使用者）：git commit 留起點 → 四份文件放進 `docs/plan/`、舊文件移 `docs/archive/` → 建立 `CLAUDE.md` → 確認 Docker 可執行、JDK 17 可用。
-- 下一張卡：**3.1**（S3 菜單）。
+- 下一張卡：**4.1**（S4 桌位與用餐紀錄）。
 
 ---
 
@@ -28,6 +28,21 @@
 
 ---
 
+## 2026-11-26　S3 菜單 完成（卡 3.1～3.8，S3 驗收通過）
+- 做了：分類、品項、選項群組與選項（含稽核）、售完與恢復、可售判斷與給訂單的快照、排序、圖片上傳／刪除／取圖、顧客菜單與 S3 驗收。全部測試 346／346 通過。
+- 動到的程式碼：新增 menu 模組（實體、Repository、MenuQueryService、MenuCategoryService、MenuItemService、ModifierService、MenuController、CustomerMenuController）、shared.model.Station；遷移 V5（station 種子 K1、K2，menu_category、menu_item、modifier_group、modifier）。
+- 決定（規格沒寫、AI 草擬）：
+  - 站別列舉放 shared（kds 不可依賴 menu）；station 表有種子但本階段不建實體。
+  - 顧客菜單與菜單圖片路徑在 /api/customer 底下，但資料屬菜單模組，所以 Controller 放 menu 模組。
+  - 品項新增預設下架（合約 default false）；分類已下架時仍可把品項設為上架，但該品項不可售（可售四條件之一）。
+  - 排序：先鎖父層（分類排序則鎖全部未刪除分類），再用鎖到的資料比對「必須剛好相等」。
+  - 圖片：舊檔在交易提交後才刪、交易回滾則刪新檔；multipart 上限放寬為 10 MB，使 2～10 MB 得 INVALID_IMAGE（>10 MB 也映射為 INVALID_IMAGE，因目前只有圖片上傳是 multipart）。
+  - 稽核的價格前後值存整數字串（資料庫讀出為 150.00，已轉為 150）。
+  - 新增 RequestRejectedHandler：被 Spring Security 防火牆拒絕的請求（如路徑含編碼斜線）回統一格式 VALIDATION_ERROR。
+  - 所有 JSON 日期請求參數須加 @DateTimeFormat(iso = ISO.DATE)（預設是依地區的短格式）。
+- 待決：無。
+- 測試：全部 346／346。
+- 下一步：S4 桌位與用餐紀錄。
 ## 2026-11-26　S2 員工、裝置與出勤 完成（卡 2.1～2.10，S2 驗收通過）
 - 做了：PIN 驗證（HMAC、以裝置防暴力、鎖定寫稽核）、首位管理者、上下班打卡、打卡狀態與歷史、管理者解鎖、員工管理、裝置管理、出勤更正、稽核查詢 API、對外介面（PIN 取員工、解鎖檢查、批次取員工名稱）與 S2 驗收。全部測試 282／282 在 MySQL 8 通過。另新增 ModuleDependencyTest：掃描 import 強制執行 §4.1 模組依賴方向，之後每個階段都會被檢查。
 - 動到的程式碼：新增 staff.employee、staff.shift、staff.unlock、staff.audit 套件與 staff.device 的管理類別；shared.security 的 PinVerifier／UnlockGate／UnlockFunction／FailureLimiter 等；遷移 V4（employee、work_shift、work_shift_history）。

@@ -56,11 +56,16 @@ public class GlobalExceptionHandler {
             HttpMessageNotReadableException.class,
             MissingServletRequestParameterException.class,
             MissingServletRequestPartException.class,
-            ServletRequestBindingException.class,
-            MaxUploadSizeExceededException.class})
+            ServletRequestBindingException.class})
     public ResponseEntity<ErrorResponse> handleValidation(Exception e) {
         log.info("請求格式錯誤：{}", e.getClass().getSimpleName());
         return respond(ErrorCode.VALIDATION_ERROR);
+    }
+
+    /** 目前只有菜單圖片上傳是 multipart，超過上傳上限視為不合法的圖片（§4.10）。 */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ErrorResponse> handleUploadTooLarge(MaxUploadSizeExceededException e) {
+        return respond(ErrorCode.INVALID_IMAGE);
     }
 
     @ExceptionHandler({NoResourceFoundException.class, NoHandlerFoundException.class})

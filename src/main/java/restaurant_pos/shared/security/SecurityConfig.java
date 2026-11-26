@@ -9,6 +9,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.firewall.RequestRejectedHandler;
 import org.springframework.security.web.access.intercept.AuthorizationFilter;
 import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy;
 import restaurant_pos.shared.error.ErrorCode;
@@ -22,6 +23,12 @@ import restaurant_pos.shared.error.ErrorCode;
 public class SecurityConfig {
 
     /** 開發環境的 Swagger 需要載入自己的腳本與樣式，只對這幾個路徑放寬 CSP。 */
+    /** 被 Spring Security 防火牆拒絕的請求（例如路徑含編碼斜線、分號）也回統一格式的錯誤，不洩漏框架預設內容。 */
+    @Bean
+    public RequestRejectedHandler requestRejectedHandler(SecurityErrorWriter errorWriter) {
+        return (request, response, ex) -> errorWriter.write(response, ErrorCode.VALIDATION_ERROR);
+    }
+
     @Bean
     @Order(1)
     @Profile("dev")

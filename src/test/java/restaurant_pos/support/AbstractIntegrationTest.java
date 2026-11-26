@@ -33,6 +33,17 @@ public abstract class AbstractIntegrationTest {
 
     static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0");
 
+    /** 測試用圖片目錄（暫存，不污染專案）。 */
+    public static final java.nio.file.Path IMAGE_DIR;
+
+    static {
+        try {
+            IMAGE_DIR = java.nio.file.Files.createTempDirectory("pos-test-images");
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static {
         MYSQL.start();
     }
@@ -42,6 +53,7 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
         registry.add("spring.datasource.username", MYSQL::getUsername);
         registry.add("spring.datasource.password", MYSQL::getPassword);
+        registry.add("restaurantpos.image-dir", () -> IMAGE_DIR.toString());
     }
 
     private static final List<String> KEEP_TABLES = List.of("flyway_schema_history", "station", "payment_method");

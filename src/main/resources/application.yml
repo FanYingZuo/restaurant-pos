@@ -23,6 +23,11 @@ spring:
           time_zone: UTC
   autoconfigure:
     exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  servlet:
+    multipart:
+      # 圖片上限 2 MB 由圖片儲存元件檢查（INVALID_IMAGE）；這裡放寬以便超過 2 MB 時得到 INVALID_IMAGE 而非框架錯誤
+      max-file-size: 10MB
+      max-request-size: 10MB
   jackson:
     default-property-inclusion: always
 
